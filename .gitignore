@@ -1,0 +1,34 @@
+# macOS
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Backend (Haskell)
+backend/dist-newstyle/
+backend/dist/
+backend/*.hi
+backend/*.o
+backend/*.exe
+backend/.cabal-sandbox/
+backend/cabal.sandbox.config
+backend/*.dyn_hi
+backend/*.dyn_o
+
+# Frontend (Node/Svelte)
+frontend/node_modules/
+frontend/dist/
+frontend/.svelte-kit/
+frontend/.vite/
+
+# Generated images (keep directory but ignore files)
+backend/static/images/*
+!backend/static/images/.gitkeep
+
+# Existing external projects (sub-repos)
+ai-comic-factory/
+comic-alpha/
+comics_generator/
