@@ -24,7 +24,7 @@ import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath (takeExtension, (</>))
 import Network.HTTP.Types.Status (status400, status500)
 import Control.Monad.IO.Class (liftIO)
-import Data.Maybe (fromMaybe, catMaybes, listToMaybe, isJust, isNothing)
+import Data.Maybe (fromMaybe, catMaybes, listToMaybe, isNothing)
 import Control.Exception (try, SomeException, displayException)
 import Network.HTTP.Conduit (HttpException)
 
@@ -51,6 +51,45 @@ instance ToJSON GenerateImageResponse where
     [ "success" .= s ]
     ++ catMaybes [ ("image_url" .=) <$> url, ("error" .=) <$> err ]
 
+-- | Request body for chat
+data ChatRequest = ChatRequest
+  { chatMessage :: T.Text
+  , chatApiKey :: T.Text
+  , chatApiBaseUrl :: T.Text
+  , chatModelName :: T.Text
+  , chatHistory :: [ChatMessage]
+  } deriving (Generic, Show)
+
+instance FromJSON ChatRequest where
+  parseJSON = withObject "ChatRequest" $ \v -> ChatRequest
+    <$> v .: "message"
+    <*> v .: "google_api_key"
+    <*> v .: "api_base_url"
+    <*> v .: "model_name"
+    <*> v .: "history"
+
+data ChatMessage = ChatMessage
+  { chatRole :: T.Text
+  , chatText :: T.Text
+  } deriving (Generic, Show)
+
+instance FromJSON ChatMessage where
+  parseJSON = withObject "ChatMessage" $ \v -> ChatMessage
+    <$> v .: "role"
+    <*> v .: "text"
+
+-- | Response body for chat
+data ChatResponse = ChatResponse
+  { chatSuccess :: Bool
+  , chatReply :: Maybe T.Text
+  , chatError :: Maybe T.Text
+  } deriving (Generic, Show)
+
+instance ToJSON ChatResponse where
+  toJSON (ChatResponse s reply err) = object $
+    [ "success" .= s ]
+    ++ catMaybes [ ("reply" .=) <$> reply, ("error" .=) <$> err ]
+
 -- | Gemini API request body
 data GeminiRequest = GeminiRequest
   { contents :: [GeminiContent]
@@ -60,10 +99,13 @@ data GeminiRequest = GeminiRequest
 instance ToJSON GeminiRequest
 
 data GeminiContent = GeminiContent
-  { parts :: [GeminiPart]
+  { role :: Maybe T.Text
+  , parts :: [GeminiPart]
   } deriving (Generic, Show)
 
-instance ToJSON GeminiContent
+instance ToJSON GeminiContent where
+  toJSON (GeminiContent (Just r) ps) = object ["role" .= r, "parts" .= ps]
+  toJSON (GeminiContent Nothing ps)  = object ["parts" .= ps]
 
 data GeminiPart = GeminiPart
   { text :: Maybe T.Text
@@ -136,17 +178,16 @@ generateFilename = do
   uuid <- nextRandom
   return $ toString uuid ++ ".png"
 
--- | Call Gemini API to generate an image
-callGeminiImageAPI :: T.Text -> T.Text -> IO (Either T.Text B.ByteString)
-callGeminiImageAPI apiKey userPrompt = do
-  let model = "gemini-3.1-flash-image-preview"
-      url = "https://generativelanguage.googleapis.com/v1beta/models/" ++ T.unpack model ++ ":generateContent?key=" ++ T.unpack apiKey
-  
+-- | Generic Gemini API call
+callGeminiAPI :: T.Text -> T.Text -> [GeminiContent] -> GeminiGenerationConfig -> IO (Either T.Text GeminiResponse)
+callGeminiAPI apiKey model contentsList genConfig = do
+  let url = "https://generativelanguage.googleapis.com/v1beta/models/" ++ T.unpack model ++ ":generateContent?key=" ++ T.unpack apiKey
+
   result <- try $ do
     req <- parseRequest url
     let geminiReq = GeminiRequest
-          { contents = [ GeminiContent { parts = [ GeminiPart { text = Just userPrompt } ] } ]
-          , generationConfig = GeminiGenerationConfig { responseModalities = ["TEXT", "IMAGE"] }
+          { contents = contentsList
+          , generationConfig = genConfig
           }
         body = RequestBodyLBS $ encode geminiReq
         req' = req
@@ -154,46 +195,19 @@ callGeminiImageAPI apiKey userPrompt = do
           , requestBody = body
           , requestHeaders = [ ("Content-Type", "application/json") ]
           }
-    
+
     manager <- newManager tlsManagerSettings
     response <- httpLbs req' manager
-    
+
     let bodyBytes = responseBody response
     putStrLn $ "[DEBUG] Gemini response size: " ++ show (BL.length bodyBytes) ++ " bytes"
-    
+
     case decode bodyBytes of
       Nothing -> do
         putStrLn $ "[ERROR] Failed to parse Gemini JSON response"
         putStrLn $ "[DEBUG] Raw response (first 1000 chars): " ++ take 1000 (T.unpack $ decodeUtf8 $ BL.toStrict bodyBytes)
         return $ Left "Failed to parse Gemini API response"
-      Just geminiResp -> do
-        let cands = candidates geminiResp
-            parts = cands >>= listToMaybe >>= candidateContent >>= contentParts
-            imageParts = catMaybes $ fmap inlineData $ fromMaybe [] parts
-            textParts = catMaybes $ fmap partText $ fromMaybe [] parts
-        
-        putStrLn $ "[DEBUG] candidates present: " ++ show (isJust cands)
-        putStrLn $ "[DEBUG] textParts count: " ++ show (length textParts)
-        putStrLn $ "[DEBUG] imageParts count: " ++ show (length imageParts)
-        
-        if isNothing cands && null textParts && null imageParts
-          then do
-            putStrLn $ "[ERROR] Gemini returned error JSON (first 1000 chars): " ++ take 1000 (T.unpack $ decodeUtf8 $ BL.toStrict bodyBytes)
-            return $ Left "Gemini API returned an error. Check logs for details."
-          else case listToMaybe imageParts of
-            Nothing -> do
-              let reason = fromMaybe "No image generated" (listToMaybe textParts)
-              putStrLn $ "[ERROR] No image in Gemini response: " ++ T.unpack reason
-              return $ Left reason
-            Just inline -> do
-              let base64Data = inlineDataData inline
-              case Base64.decode (encodeUtf8 base64Data) of
-                Left err -> do
-                  putStrLn $ "[ERROR] Base64 decode failed: " ++ err
-                  return $ Left $ T.pack $ "Base64 decode error: " ++ err
-                Right imgBytes -> do
-                  putStrLn $ "[INFO] Image decoded: " ++ show (B.length imgBytes) ++ " bytes"
-                  return $ Right imgBytes
+      Just geminiResp -> return $ Right geminiResp
 
   case result of
     Left (e :: SomeException) -> do
@@ -201,6 +215,137 @@ callGeminiImageAPI apiKey userPrompt = do
       putStrLn $ "[ERROR] Exception during Gemini API call: " ++ displayException e
       return $ Left msg
     Right inner -> return inner
+
+-- | Extract text parts from Gemini response
+extractTextParts :: GeminiResponse -> [T.Text]
+extractTextParts resp =
+  let cands = candidates resp
+      parts = cands >>= listToMaybe >>= candidateContent >>= contentParts
+  in  catMaybes $ fmap partText $ fromMaybe [] parts
+
+-- | Extract image parts from Gemini response
+extractImageParts :: GeminiResponse -> [GeminiInlineData]
+extractImageParts resp =
+  let cands = candidates resp
+      parts = cands >>= listToMaybe >>= candidateContent >>= contentParts
+  in  catMaybes $ fmap inlineData $ fromMaybe [] parts
+
+-- | Call Gemini API to generate an image
+callGeminiImageAPI :: T.Text -> T.Text -> IO (Either T.Text B.ByteString)
+callGeminiImageAPI apiKey userPrompt = do
+  let model = "gemini-3.1-flash-image-preview"
+      contentsList = [ GeminiContent { role = Nothing, parts = [ GeminiPart { text = Just userPrompt } ] } ]
+      genConfig = GeminiGenerationConfig { responseModalities = ["TEXT", "IMAGE"] }
+
+  result <- callGeminiAPI apiKey model contentsList genConfig
+  case result of
+    Left err -> return $ Left err
+    Right geminiResp -> do
+      let textParts = extractTextParts geminiResp
+          imageParts = extractImageParts geminiResp
+
+      putStrLn $ "[DEBUG] textParts count: " ++ show (length textParts)
+      putStrLn $ "[DEBUG] imageParts count: " ++ show (length imageParts)
+
+      if isNothing (candidates geminiResp) && null textParts && null imageParts
+        then do
+          putStrLn $ "[ERROR] Gemini returned error JSON"
+          return $ Left "Gemini API returned an error. Check logs for details."
+        else case listToMaybe imageParts of
+          Nothing -> do
+            let reason = fromMaybe "No image generated" (listToMaybe textParts)
+            putStrLn $ "[ERROR] No image in Gemini response: " ++ T.unpack reason
+            return $ Left reason
+          Just inline -> do
+            let base64Data = inlineDataData inline
+            case Base64.decode (encodeUtf8 base64Data) of
+              Left err -> do
+                putStrLn $ "[ERROR] Base64 decode failed: " ++ err
+                return $ Left $ T.pack $ "Base64 decode error: " ++ err
+              Right imgBytes -> do
+                putStrLn $ "[INFO] Image decoded: " ++ show (B.length imgBytes) ++ " bytes"
+                return $ Right imgBytes
+
+-- | Call GPT-compatible API for text chat
+callChatAPI :: T.Text -> T.Text -> T.Text -> T.Text -> [ChatMessage] -> IO (Either T.Text T.Text)
+callChatAPI apiKey apiBaseUrl modelName userMessage history = do
+  let url = T.unpack $ apiBaseUrl <> "/chat/completions"
+
+  result <- try $ do
+    req <- parseRequest url
+    let gptReq = GPTChatRequest
+          { gptModel = modelName
+          , gptMessages = map msgToGPT (history ++ [ChatMessage "user" userMessage])
+          }
+        body = RequestBodyLBS $ encode gptReq
+        req' = req
+          { method = "POST"
+          , requestBody = body
+          , requestHeaders =
+              [ ("Content-Type", "application/json")
+              , ("Authorization", "Bearer " <> encodeUtf8 apiKey)
+              ]
+          }
+
+    manager <- newManager tlsManagerSettings
+    response <- httpLbs req' manager
+
+    let bodyBytes = responseBody response
+    putStrLn $ "[DEBUG] Chat API response size: " ++ show (BL.length bodyBytes) ++ " bytes"
+
+    case decode bodyBytes of
+      Nothing -> do
+        putStrLn $ "[ERROR] Failed to parse Chat API JSON response"
+        putStrLn $ "[DEBUG] Raw response (first 1000 chars): " ++ take 1000 (T.unpack $ decodeUtf8 $ BL.toStrict bodyBytes)
+        return $ Left "Failed to parse Chat API response"
+      Just (gptResp :: GPTChatResponse) -> do
+        case gptChoices gptResp of
+          [] -> do
+            putStrLn $ "[ERROR] No choices in Chat API response"
+            return $ Left "No response from API"
+          (choice:_) -> do
+            let replyText = gptContent $ gptMessage choice
+            putStrLn $ "[INFO] Chat reply length: " ++ show (T.length replyText)
+            return $ Right replyText
+
+  case result of
+    Left (e :: SomeException) -> do
+      let msg = T.pack $ displayException e
+      putStrLn $ "[ERROR] Exception during Chat API call: " ++ displayException e
+      return $ Left msg
+    Right inner -> return inner
+  where
+    msgToGPT :: ChatMessage -> GPTMessage
+    msgToGPT msg = GPTMessage (chatRole msg) (chatText msg)
+
+-- | GPT-compatible API request types
+data GPTChatRequest = GPTChatRequest
+  { gptModel :: T.Text
+  , gptMessages :: [GPTMessage]
+  } deriving (Generic, Show)
+
+instance ToJSON GPTChatRequest
+
+data GPTMessage = GPTMessage
+  { gptRole :: T.Text
+  , gptContent :: T.Text
+  } deriving (Generic, Show)
+
+instance ToJSON GPTMessage where
+  toJSON (GPTMessage r c) = object ["role" .= r, "content" .= c]
+
+-- | GPT-compatible API response types
+data GPTChatResponse = GPTChatResponse
+  { gptChoices :: [GPTChoice]
+  } deriving (Generic, Show)
+
+instance FromJSON GPTChatResponse
+
+data GPTChoice = GPTChoice
+  { gptMessage :: GPTMessage
+  } deriving (Generic, Show)
+
+instance FromJSON GPTChoice
 
 -- | Save image bytes to file and return relative URL
 saveGeneratedImage :: B.ByteString -> IO FilePath
@@ -252,6 +397,31 @@ main = do
               imagePath <- liftIO $ saveGeneratedImage imgBytes
               liftIO $ putStrLn $ "[INFO] Image saved: " ++ imagePath
               json $ GenerateImageResponse True (Just $ T.pack imagePath) Nothing
+
+    -- Chat endpoint
+    post "/api/chat" $ do
+      reqBody <- body
+      case decode reqBody of
+        Nothing -> do
+          liftIO $ putStrLn "[ERROR] Invalid JSON request body for chat"
+          status status400
+          json $ ChatResponse False Nothing (Just "Invalid JSON request body")
+        Just (ChatRequest {..}) -> do
+          liftIO $ putStrLn $ "[INFO] Chat request, message length: " ++ show (T.length chatMessage) ++ ", model: " ++ T.unpack chatModelName ++ ", history: " ++ show (length chatHistory)
+          result <- liftIO $ try $ callChatAPI chatApiKey chatApiBaseUrl chatModelName chatMessage chatHistory
+          case result of
+            Left (e :: SomeException) -> do
+              let msg = T.pack $ displayException e
+              liftIO $ putStrLn $ "[ERROR] Unhandled exception in chat handler: " ++ displayException e
+              status status500
+              json $ ChatResponse False Nothing (Just msg)
+            Right (Left err) -> do
+              liftIO $ putStrLn $ "[ERROR] Chat API returned error: " ++ T.unpack err
+              status status500
+              json $ ChatResponse False Nothing (Just err)
+            Right (Right replyText) -> do
+              liftIO $ putStrLn $ "[INFO] Chat reply sent, length: " ++ show (T.length replyText)
+              json $ ChatResponse True (Just replyText) Nothing
 
     -- Serve generated images
     get "/backend/static/images/:filename" $ do
