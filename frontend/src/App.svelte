@@ -12,6 +12,7 @@
   let chatMessages = [];
   let chatLoading = false;
   let chatError = '';
+  let chatApiKey = '';
   let chatApiBaseUrl = 'https://api.openai.com/v1';
   let chatModelName = 'gpt-4o-mini';
   let chatImageFile = null;
@@ -53,8 +54,8 @@
 
   async function handleSendChat() {
     if (!chatInput.trim() && !chatImageBase64) return;
-    if (!apiKey.trim()) {
-      chatError = 'Google API Keyを入力してください / Please enter a Google API Key';
+    if (!chatApiKey.trim()) {
+      chatError = 'APIキーを入力してください / Please enter an API Key';
       return;
     }
 
@@ -73,7 +74,7 @@
       .map(m => ({ role: m.role, text: m.text }));
 
     try {
-      const res = await chat({ message: userText, google_api_key: apiKey, api_base_url: chatApiBaseUrl, model_name: chatModelName, image: userImage, history });
+      const res = await chat({ message: userText, google_api_key: chatApiKey, api_base_url: chatApiBaseUrl, model_name: chatModelName, image: userImage, history });
       if (res.success && res.reply) {
         chatMessages = [...chatMessages, { role: 'assistant', text: res.reply }];
       } else {
@@ -163,6 +164,10 @@
     <p class="section-desc">GPT互換API とテキストで対話します / Chat with GPT-compatible API</p>
 
     <div class="chat-settings">
+      <label>
+        <span>API Key / APIキー</span>
+        <input type="password" bind:value={chatApiKey} placeholder="sk-..." />
+      </label>
       <label>
         <span>API Base URL</span>
         <input type="text" bind:value={chatApiBaseUrl} placeholder="https://api.openai.com/v1" />
