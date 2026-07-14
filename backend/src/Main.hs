@@ -391,19 +391,23 @@ instance ToJSON GPTMessage where
 -- | GPT-compatible API response types
 data GPTChatResponse = GPTChatResponse
   { gptChoices :: [GPTChoice]
-  } deriving (Generic, Show)
+  } deriving (Show)
 
-instance FromJSON GPTChatResponse
+instance FromJSON GPTChatResponse where
+  parseJSON = withObject "GPTChatResponse" $ \v -> GPTChatResponse
+    <$> v .: "choices"
 
 data GPTChoice = GPTChoice
   { gptMessage :: GPTResponseMessage
-  } deriving (Generic, Show)
+  } deriving (Show)
 
-instance FromJSON GPTChoice
+instance FromJSON GPTChoice where
+  parseJSON = withObject "GPTChoice" $ \v -> GPTChoice
+    <$> v .: "message"
 
 data GPTResponseMessage = GPTResponseMessage
   { gptResponseContent :: T.Text
-  } deriving (Generic, Show)
+  } deriving (Show)
 
 instance FromJSON GPTResponseMessage where
   parseJSON = withObject "GPTResponseMessage" $ \v -> GPTResponseMessage
