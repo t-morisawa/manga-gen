@@ -14,6 +14,9 @@
   let chatError = '';
   let chatApiBaseUrl = 'https://api.openai.com/v1';
   let chatModelName = 'gpt-4o-mini';
+  let chatImageFile = null;
+  let chatImageBase64 = '';
+  let chatImagePreview = '';
 
   // Health check on mount
   healthCheck()
@@ -49,15 +52,19 @@
   }
 
   async function handleSendChat() {
-    if (!chatInput.trim()) return;
+    if (!chatInput.trim() && !chatImageBase64) return;
     if (!apiKey.trim()) {
       chatError = 'Google API Keyを入力してください / Please enter a Google API Key';
       return;
     }
 
     const userText = chatInput.trim();
-    chatMessages = [...chatMessages, { role: 'user', text: userText }];
+    const userImage = chatImageBase64 || null;
+    chatMessages = [...chatMessages, { role: 'user', text: userText, image: chatImagePreview || null }];
     chatInput = '';
+    chatImageFile = null;
+    chatImageBase64 = '';
+    chatImagePreview = '';
     chatLoading = true;
     chatError = '';
 
@@ -66,7 +73,7 @@
       .map(m => ({ role: m.role, text: m.text }));
 
     try {
-      const res = await chat({ message: userText, google_api_key: apiKey, api_base_url: chatApiBaseUrl, model_name: chatModelName, history });
+      const res = await chat({ message: userText, google_api_key: apiKey, api_base_url: chatApiBaseUrl, model_name: chatModelName, image: userImage, history });
       if (res.success && res.reply) {
         chatMessages = [...chatMessages, { role: 'assistant', text: res.reply }];
       } else {
@@ -86,9 +93,31 @@
     }
   }
 
+  function handleImageSelect(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    chatImageFile = file;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const dataUrl = e.target.result;
+      chatImagePreview = dataUrl;
+      const base64Part = dataUrl.split(',')[1];
+      chatImageBase64 = base64Part;
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function clearChatImage() {
+    chatImageFile = null;
+    chatImageBase64 = '';
+    chatImagePreview = '';
+  }
+
   function clearChat() {
     chatMessages = [];
     chatError = '';
+    clearChatImage();
   }
 </script>
 
@@ -150,13 +179,18 @@
       {/if}
       {#each chatMessages as msg}
         <div class="chat-message {msg.role}">
-          <div class="chat-role">{msg.role === 'user' ? 'You' : 'Gemini'}</div>
-          <div class="chat-text">{msg.text}</div>
+          <div class="chat-role">{msg.role === 'user' ? 'You' : 'AI'}</div>
+          {#if msg.image}
+            <img src={msg.image} alt="Uploaded" class="chat-image" />
+          {/if}
+          {#if msg.text}
+            <div class="chat-text">{msg.text}</div>
+          {/if}
         </div>
       {/each}
       {#if chatLoading}
         <div class="chat-message assistant">
-          <div class="chat-role">Gemini</div>
+          <div class="chat-role">AI</div>
           <div class="chat-text chat-thinking">考え中... / Thinking...</div>
         </div>
       {/if}
@@ -167,15 +201,27 @@
     {/if}
 
     <div class="chat-input-row">
-      <textarea
-        bind:value={chatInput}
-        on:keydown={handleChatKeydown}
-        rows="3"
-        placeholder="メッセージを入力... / Type a message..."
-        disabled={chatLoading}
-      ></textarea>
+      {#if chatImagePreview}
+        <div class="chat-image-preview">
+          <img src={chatImagePreview} alt="Preview" />
+          <button class="btn-remove-image" on:click={clearChatImage}>×</button>
+        </div>
+      {/if}
+      <div class="chat-input-controls">
+        <label class="btn-upload">
+          <input type="file" accept="image/*" on:change={handleImageSelect} disabled={chatLoading} />
+          画像を追加 / Add Image
+        </label>
+        <textarea
+          bind:value={chatInput}
+          on:keydown={handleChatKeydown}
+          rows="3"
+          placeholder="メッセージを入力... / Type a message..."
+          disabled={chatLoading}
+        ></textarea>
+      </div>
       <div class="chat-buttons">
-        <button on:click={handleSendChat} disabled={chatLoading}>
+        <button on:click={handleSendChat} disabled={chatLoading || (!chatInput.trim() && !chatImageBase64)}>
           {chatLoading ? '送信中... / Sending...' : '送信 / Send'}
         </button>
         <button class="btn-secondary" on:click={clearChat} disabled={chatLoading}>
@@ -398,6 +444,80 @@
   .chat-thinking {
     color: #999;
     font-style: italic;
+  }
+
+  .chat-image {
+    max-width: 200px;
+    max-height: 200px;
+    border-radius: 6px;
+    margin-bottom: 6px;
+    display: block;
+  }
+
+  .chat-image-preview {
+    position: relative;
+    display: inline-block;
+  }
+
+  .chat-image-preview img {
+    max-width: 120px;
+    max-height: 120px;
+    border-radius: 6px;
+    border: 1px solid #ccc;
+  }
+
+  .btn-remove-image {
+    position: absolute;
+    top: -8px;
+    right: -8px;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: #c62828;
+    color: #fff;
+    border: none;
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .btn-remove-image:hover {
+    background: #b71c1c;
+  }
+
+  .chat-input-controls {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+  }
+
+  .chat-input-controls textarea {
+    flex: 1;
+  }
+
+  .btn-upload {
+    display: inline-flex;
+    align-items: center;
+    padding: 10px 14px;
+    background: #e0e0e0;
+    color: #333;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    cursor: pointer;
+    transition: background 0.2s;
+    white-space: nowrap;
+  }
+
+  .btn-upload:hover {
+    background: #bdbdbd;
+  }
+
+  .btn-upload input[type="file"] {
+    display: none;
   }
 
   .chat-input-row {

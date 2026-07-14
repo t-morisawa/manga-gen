@@ -24,7 +24,7 @@ import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath (takeExtension, (</>))
 import Network.HTTP.Types.Status (status400, status500)
 import Control.Monad.IO.Class (liftIO)
-import Data.Maybe (fromMaybe, catMaybes, listToMaybe, isNothing)
+import Data.Maybe (fromMaybe, catMaybes, listToMaybe, isNothing, isJust)
 import Control.Exception (try, SomeException, displayException)
 import Network.HTTP.Conduit (HttpException)
 
@@ -53,11 +53,12 @@ instance ToJSON GenerateImageResponse where
 
 -- | Request body for chat
 data ChatRequest = ChatRequest
-  { chatMessage :: T.Text
-  , chatApiKey :: T.Text
-  , chatApiBaseUrl :: T.Text
-  , chatModelName :: T.Text
-  , chatHistory :: [ChatMessage]
+  { reqMessage :: T.Text
+  , reqApiKey :: T.Text
+  , reqApiBaseUrl :: T.Text
+  , reqModelName :: T.Text
+  , reqImage :: Maybe T.Text
+  , reqHistory :: [ChatMessage]
   } deriving (Generic, Show)
 
 instance FromJSON ChatRequest where
@@ -66,17 +67,20 @@ instance FromJSON ChatRequest where
     <*> v .: "google_api_key"
     <*> v .: "api_base_url"
     <*> v .: "model_name"
+    <*> v .:? "image"
     <*> v .: "history"
 
 data ChatMessage = ChatMessage
   { chatRole :: T.Text
   , chatText :: T.Text
+  , chatImage :: Maybe T.Text
   } deriving (Generic, Show)
 
 instance FromJSON ChatMessage where
   parseJSON = withObject "ChatMessage" $ \v -> ChatMessage
     <$> v .: "role"
     <*> v .: "text"
+    <*> v .:? "image"
 
 -- | Response body for chat
 data ChatResponse = ChatResponse
@@ -267,15 +271,17 @@ callGeminiImageAPI apiKey userPrompt = do
                 return $ Right imgBytes
 
 -- | Call GPT-compatible API for text chat
-callChatAPI :: T.Text -> T.Text -> T.Text -> T.Text -> [ChatMessage] -> IO (Either T.Text T.Text)
-callChatAPI apiKey apiBaseUrl modelName userMessage history = do
+callChatAPI :: T.Text -> T.Text -> T.Text -> T.Text -> Maybe T.Text -> [ChatMessage] -> IO (Either T.Text T.Text)
+callChatAPI apiKey apiBaseUrl modelName userMessage userImage history = do
   let url = T.unpack $ apiBaseUrl <> "/chat/completions"
 
   result <- try $ do
     req <- parseRequest url
-    let gptReq = GPTChatRequest
+    let currentUserMsg = ChatMessage "user" userMessage userImage
+        allMessages = history ++ [currentUserMsg]
+        gptReq = GPTChatRequest
           { gptModel = modelName
-          , gptMessages = map msgToGPT (history ++ [ChatMessage "user" userMessage])
+          , gptMessages = map msgToGPT allMessages
           }
         body = RequestBodyLBS $ encode gptReq
         req' = req
@@ -304,7 +310,7 @@ callChatAPI apiKey apiBaseUrl modelName userMessage history = do
             putStrLn $ "[ERROR] No choices in Chat API response"
             return $ Left "No response from API"
           (choice:_) -> do
-            let replyText = gptContent $ gptMessage choice
+            let replyText = gptResponseContent $ gptMessage choice
             putStrLn $ "[INFO] Chat reply length: " ++ show (T.length replyText)
             return $ Right replyText
 
@@ -316,7 +322,15 @@ callChatAPI apiKey apiBaseUrl modelName userMessage history = do
     Right inner -> return inner
   where
     msgToGPT :: ChatMessage -> GPTMessage
-    msgToGPT msg = GPTMessage (chatRole msg) (chatText msg)
+    msgToGPT msg = case chatImage msg of
+      Nothing -> GPTMessage (chatRole msg) (GPTContentText (chatText msg))
+      Just imgBase64 ->
+        let imgDataUrl = "data:image/png;base64," <> imgBase64
+            parts =
+              [ GPTContentPart "text" (Just (chatText msg)) Nothing
+              , GPTContentPart "image_url" Nothing (Just (GPTImageUrl imgDataUrl))
+              ]
+        in  GPTMessage (chatRole msg) (GPTContentParts parts)
 
 -- | GPT-compatible API request types
 data GPTChatRequest = GPTChatRequest
@@ -328,8 +342,37 @@ instance ToJSON GPTChatRequest
 
 data GPTMessage = GPTMessage
   { gptRole :: T.Text
-  , gptContent :: T.Text
+  , gptContent :: GPTContent
   } deriving (Generic, Show)
+
+data GPTContent
+  = GPTContentText T.Text
+  | GPTContentParts [GPTContentPart]
+  deriving (Generic, Show)
+
+instance ToJSON GPTContent where
+  toJSON (GPTContentText t) = Aeson.toJSON t
+  toJSON (GPTContentParts parts) = Aeson.toJSON parts
+
+data GPTContentPart = GPTContentPart
+  { partType :: T.Text
+  , gptPartText :: Maybe T.Text
+  , partImageUrl :: Maybe GPTImageUrl
+  } deriving (Generic, Show)
+
+instance ToJSON GPTContentPart where
+  toJSON (GPTContentPart "text" (Just t) _) =
+    object ["type" .= ("text" :: T.Text), "text" .= t]
+  toJSON (GPTContentPart "image_url" _ (Just url)) =
+    object ["type" .= ("image_url" :: T.Text), "image_url" .= url]
+  toJSON _ = object []
+
+data GPTImageUrl = GPTImageUrl
+  { imageUrlUrl :: T.Text
+  } deriving (Generic, Show)
+
+instance ToJSON GPTImageUrl where
+  toJSON (GPTImageUrl u) = object ["url" .= u]
 
 instance ToJSON GPTMessage where
   toJSON (GPTMessage r c) = object ["role" .= r, "content" .= c]
@@ -342,10 +385,18 @@ data GPTChatResponse = GPTChatResponse
 instance FromJSON GPTChatResponse
 
 data GPTChoice = GPTChoice
-  { gptMessage :: GPTMessage
+  { gptMessage :: GPTResponseMessage
   } deriving (Generic, Show)
 
 instance FromJSON GPTChoice
+
+data GPTResponseMessage = GPTResponseMessage
+  { gptResponseContent :: T.Text
+  } deriving (Generic, Show)
+
+instance FromJSON GPTResponseMessage where
+  parseJSON = withObject "GPTResponseMessage" $ \v -> GPTResponseMessage
+    <$> v .: "content"
 
 -- | Save image bytes to file and return relative URL
 saveGeneratedImage :: B.ByteString -> IO FilePath
@@ -407,8 +458,8 @@ main = do
           status status400
           json $ ChatResponse False Nothing (Just "Invalid JSON request body")
         Just (ChatRequest {..}) -> do
-          liftIO $ putStrLn $ "[INFO] Chat request, message length: " ++ show (T.length chatMessage) ++ ", model: " ++ T.unpack chatModelName ++ ", history: " ++ show (length chatHistory)
-          result <- liftIO $ try $ callChatAPI chatApiKey chatApiBaseUrl chatModelName chatMessage chatHistory
+          liftIO $ putStrLn $ "[INFO] Chat request, message length: " ++ show (T.length reqMessage) ++ ", model: " ++ T.unpack reqModelName ++ ", hasImage: " ++ show (isJust reqImage) ++ ", history: " ++ show (length reqHistory)
+          result <- liftIO $ try $ callChatAPI reqApiKey reqApiBaseUrl reqModelName reqMessage reqImage reqHistory
           case result of
             Left (e :: SomeException) -> do
               let msg = T.pack $ displayException e

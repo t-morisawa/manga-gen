@@ -14,7 +14,7 @@ export async function generateImage(request) {
 }
 
 /**
- * @param {{ message: string, google_api_key: string, api_base_url: string, model_name: string, history: Array<{ role: string, text: string }> }} request
+ * @param {{ message: string, google_api_key: string, api_base_url: string, model_name: string, image?: string, history: Array<{ role: string, text: string, image?: string }> }} request
  * @returns {Promise<{ success: boolean, reply?: string, error?: string }>}
  */
 export async function chat(request) {
