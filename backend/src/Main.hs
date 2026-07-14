@@ -59,7 +59,16 @@ data ChatRequest = ChatRequest
   , reqModelName :: T.Text
   , reqImage :: Maybe T.Text
   , reqHistory :: [ChatMessage]
-  } deriving (Generic, Show)
+  } deriving (Generic)
+
+instance Show ChatRequest where
+  show (ChatRequest msg _ baseUrl modelName img hist) =
+    "ChatRequest { message = " ++ show msg ++
+    ", apiKey = ***" ++
+    ", apiBaseUrl = " ++ show baseUrl ++
+    ", modelName = " ++ show modelName ++
+    ", image = " ++ show img ++
+    ", history = " ++ show (length hist) ++ " items }"
 
 instance FromJSON ChatRequest where
   parseJSON = withObject "ChatRequest" $ \v -> ChatRequest
@@ -338,7 +347,9 @@ data GPTChatRequest = GPTChatRequest
   , gptMessages :: [GPTMessage]
   } deriving (Generic, Show)
 
-instance ToJSON GPTChatRequest
+instance ToJSON GPTChatRequest where
+  toJSON (GPTChatRequest model msgs) =
+    object ["model" .= model, "messages" .= msgs]
 
 data GPTMessage = GPTMessage
   { gptRole :: T.Text
