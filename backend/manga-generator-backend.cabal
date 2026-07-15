@@ -80,7 +80,8 @@ executable manga-generator-backend
                       text,
                       time,
                       filepath,
-                      wai-extra
+                      wai-extra,
+                      sqlite-simple
 
     -- Directories containing source files.
     hs-source-dirs:   src

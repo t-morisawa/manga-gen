@@ -27,6 +27,8 @@ import Control.Monad.IO.Class (liftIO)
 import Data.Maybe (fromMaybe, catMaybes, listToMaybe, isNothing, isJust)
 import Control.Exception (try, SomeException, displayException)
 import Network.HTTP.Conduit (HttpException)
+import Database.SQLite.Simple (Connection, open, execute_, execute, query_, query, close)
+import qualified Database.SQLite.Simple as SQLite
 
 -- | Request body for image generation
 data GenerateImageRequest = GenerateImageRequest
@@ -422,9 +424,83 @@ saveGeneratedImage imgBytes = do
   B.writeFile filepath imgBytes
   return $ "/backend/static/images/" ++ filename
 
+dbPath :: FilePath
+dbPath = "manga_gen.db"
+
+initDB :: IO Connection
+initDB = do
+  conn <- open dbPath
+  execute_ conn "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+  return conn
+
+data SettingsRequest = SettingsRequest
+  { setGoogleApiKey :: Maybe T.Text
+  , setChatApiKey :: Maybe T.Text
+  , setChatApiBaseUrl :: Maybe T.Text
+  , setChatModelName :: Maybe T.Text
+  } deriving (Generic, Show)
+
+instance FromJSON SettingsRequest where
+  parseJSON = withObject "SettingsRequest" $ \v -> SettingsRequest
+    <$> v .:? "google_api_key"
+    <*> v .:? "chat_api_key"
+    <*> v .:? "chat_api_base_url"
+    <*> v .:? "chat_model_name"
+
+instance ToJSON SettingsRequest where
+  toJSON (SettingsRequest g c cb m) = object $
+    catMaybes
+      [ ("google_api_key" .=) <$> g
+      , ("chat_api_key" .=) <$> c
+      , ("chat_api_base_url" .=) <$> cb
+      , ("chat_model_name" .=) <$> m
+      ]
+
+data SettingsResponse = SettingsResponse
+  { resGoogleApiKey :: T.Text
+  , resChatApiKey :: T.Text
+  , resChatApiBaseUrl :: T.Text
+  , resChatModelName :: T.Text
+  } deriving (Generic, Show)
+
+instance ToJSON SettingsResponse where
+  toJSON (SettingsResponse g c cb m) = object
+    [ "google_api_key" .= g
+    , "chat_api_key" .= c
+    , "chat_api_base_url" .= cb
+    , "chat_model_name" .= m
+    ]
+
+getSetting :: Connection -> T.Text -> IO T.Text
+getSetting conn key = do
+  rows <- query conn "SELECT value FROM settings WHERE key = ?" (SQLite.Only key) :: IO [(SQLite.Only T.Text)]
+  case rows of
+    ((SQLite.Only val):_) -> return val
+    [] -> return ""
+
+setSetting :: Connection -> T.Text -> T.Text -> IO ()
+setSetting conn key val = do
+  execute conn "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)" (key, val)
+
+getAllSettings :: Connection -> IO SettingsResponse
+getAllSettings conn = do
+  g <- getSetting conn "google_api_key"
+  c <- getSetting conn "chat_api_key"
+  cb <- getSetting conn "chat_api_base_url"
+  m <- getSetting conn "chat_model_name"
+  return $ SettingsResponse g c cb m
+
+saveSettings :: Connection -> SettingsRequest -> IO ()
+saveSettings conn (SettingsRequest g c cb m) = do
+  maybe (return ()) (setSetting conn "google_api_key") g
+  maybe (return ()) (setSetting conn "chat_api_key") c
+  maybe (return ()) (setSetting conn "chat_api_base_url") cb
+  maybe (return ()) (setSetting conn "chat_model_name") m
+
 main :: IO ()
 main = do
   ensureStaticDir
+  conn <- initDB
   putStrLn "Starting manga-generator-backend on http://localhost:5003"
   scotty 5003 $ do
     middleware logStdoutDev
@@ -434,9 +510,24 @@ main = do
       , corsRequestHeaders = ["Content-Type"]
       }
 
-    -- Health check
     get "/api/health" $ do
       json $ object ["status" .= ("ok" :: String), "message" .= ("Manga generator API is running" :: String)]
+
+    get "/api/settings" $ do
+      settings <- liftIO $ getAllSettings conn
+      json settings
+
+    post "/api/settings" $ do
+      reqBody <- body
+      case decode reqBody of
+        Nothing -> do
+          liftIO $ putStrLn "[ERROR] Invalid JSON for settings"
+          status status400
+          json $ object ["error" .= ("Invalid JSON" :: String)]
+        Just settingsReq -> do
+          liftIO $ saveSettings conn settingsReq
+          liftIO $ putStrLn "[INFO] Settings saved"
+          json $ object ["success" .= True]
 
     -- Generate image endpoint
     post "/api/generate-image" $ do

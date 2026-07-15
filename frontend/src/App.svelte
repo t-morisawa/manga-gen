@@ -1,5 +1,5 @@
 <script>
-  import { generateImage, chat, healthCheck } from './lib/api.js';
+  import { generateImage, chat, healthCheck, getSettings, saveSettings } from './lib/api.js';
 
   let prompt = '';
   let apiKey = '';
@@ -18,11 +18,33 @@
   let chatImageFile = null;
   let chatImageBase64 = '';
   let chatImagePreview = '';
+  let settingsSaved = false;
 
-  // Health check on mount
   healthCheck()
     .then(() => { backendStatus = 'connected'; })
     .catch(() => { backendStatus = 'disconnected'; });
+
+  getSettings().then(s => {
+    if (s.google_api_key) apiKey = s.google_api_key;
+    if (s.chat_api_key) chatApiKey = s.chat_api_key;
+    if (s.chat_api_base_url) chatApiBaseUrl = s.chat_api_base_url;
+    if (s.chat_model_name) chatModelName = s.chat_model_name;
+  }).catch(() => {});
+
+  async function handleSaveSettings() {
+    try {
+      await saveSettings({
+        google_api_key: apiKey,
+        chat_api_key: chatApiKey,
+        chat_api_base_url: chatApiBaseUrl,
+        chat_model_name: chatModelName,
+      });
+      settingsSaved = true;
+      setTimeout(() => { settingsSaved = false; }, 2000);
+    } catch (e) {
+      console.error('Failed to save settings', e);
+    }
+  }
 
   async function handleGenerate() {
     if (!prompt.trim()) {
@@ -130,12 +152,34 @@
     Backend: <span class={backendStatus === 'connected' ? 'ok' : 'ng'}>{backendStatus}</span>
   </div>
 
-  <div class="form">
-    <label>
-      <span>Google API Key</span>
-      <input type="password" bind:value={apiKey} placeholder="Enter your Gemini API key" />
-    </label>
+  <div class="settings-panel">
+    <div class="settings-header">
+      <h3>API Settings / API設定</h3>
+      <button class="btn-save-settings" on:click={handleSaveSettings}>
+        {settingsSaved ? '保存済み / Saved!' : '設定を保存 / Save Settings'}
+      </button>
+    </div>
+    <div class="settings-fields">
+      <label>
+        <span>Google API Key (画像生成用)</span>
+        <input type="password" bind:value={apiKey} placeholder="Gemini API key" />
+      </label>
+      <label>
+        <span>Chat API Key</span>
+        <input type="password" bind:value={chatApiKey} placeholder="sk-..." />
+      </label>
+      <label>
+        <span>Chat API Base URL</span>
+        <input type="text" bind:value={chatApiBaseUrl} placeholder="https://api.openai.com/v1" />
+      </label>
+      <label>
+        <span>Chat Model Name</span>
+        <input type="text" bind:value={chatModelName} placeholder="gpt-4o-mini" />
+      </label>
+    </div>
+  </div>
 
+  <div class="form">
     <label>
       <span>Prompt / プロンプト</span>
       <textarea bind:value={prompt} rows="6" placeholder="Describe the image you want to generate..."></textarea>
@@ -162,21 +206,6 @@
   <section class="chat-section">
     <h2>LLM Chat / チャット</h2>
     <p class="section-desc">GPT互換API とテキストで対話します / Chat with GPT-compatible API</p>
-
-    <div class="chat-settings">
-      <label>
-        <span>API Key / APIキー</span>
-        <input type="password" bind:value={chatApiKey} placeholder="sk-..." />
-      </label>
-      <label>
-        <span>API Base URL</span>
-        <input type="text" bind:value={chatApiBaseUrl} placeholder="https://api.openai.com/v1" />
-      </label>
-      <label>
-        <span>Model Name / モデル名</span>
-        <input type="text" bind:value={chatModelName} placeholder="gpt-4o-mini" />
-      </label>
-    </div>
 
     <div class="chat-messages">
       {#if chatMessages.length === 0}
@@ -275,6 +304,69 @@
   .status-bar .ok { color: #2e7d32; font-weight: bold; }
   .status-bar .ng { color: #c62828; font-weight: bold; }
 
+  .settings-panel {
+    margin-bottom: 20px;
+    padding: 16px;
+    background: #f9f9f9;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+  }
+
+  .settings-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+
+  .settings-header h3 {
+    margin: 0;
+    font-size: 1rem;
+    color: #333;
+  }
+
+  .btn-save-settings {
+    padding: 8px 14px;
+    background: #43a047;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+
+  .btn-save-settings:hover {
+    background: #388e3c;
+  }
+
+  .settings-fields {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .settings-fields label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.85rem;
+    color: #555;
+  }
+
+  .settings-fields input {
+    padding: 8px 10px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    font-size: 0.9rem;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+
+  .settings-fields input:focus {
+    border-color: #1976d2;
+  }
+
   .form {
     display: flex;
     flex-direction: column;
@@ -363,37 +455,6 @@
     margin: 0 0 16px;
     color: #666;
     font-size: 0.9rem;
-  }
-
-  .chat-settings {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    margin-bottom: 16px;
-    padding: 12px;
-    background: #f5f5f5;
-    border-radius: 8px;
-  }
-
-  .chat-settings label {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    font-size: 0.85rem;
-    color: #555;
-  }
-
-  .chat-settings input {
-    padding: 8px 10px;
-    border: 1px solid #ccc;
-    border-radius: 6px;
-    font-size: 0.9rem;
-    outline: none;
-    transition: border-color 0.2s;
-  }
-
-  .chat-settings input:focus {
-    border-color: #1976d2;
   }
 
   .chat-messages {

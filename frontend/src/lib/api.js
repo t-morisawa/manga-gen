@@ -30,3 +30,17 @@ export async function healthCheck() {
   const res = await fetch(`${API_BASE}/api/health`);
   return await res.json();
 }
+
+export async function getSettings() {
+  const res = await fetch(`${API_BASE}/api/settings`);
+  return await res.json();
+}
+
+export async function saveSettings(settings) {
+  const res = await fetch(`${API_BASE}/api/settings`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings),
+  });
+  return await res.json();
+}
