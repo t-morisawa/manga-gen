@@ -191,6 +191,91 @@
       ssLoading = false;
     }
   }
+
+  // ── Manga Generation state ──
+  let mgManuscript = '';
+  let mgSystemPrompt = '';
+  let mgTotalPages = 3;
+  let mgGoogleApiKey = '';
+  let mgLoading = false;
+  let mgError = '';
+  let mgJobId = '';
+  let mgJobStatus = null;
+  let mgPollInterval = null;
+
+  async function handleGeneratePages() {
+    if (!mgManuscript.trim()) {
+      mgError = '原稿を入力してください / Please enter a manuscript';
+      return;
+    }
+    if (!chatApiKey.trim()) {
+      mgError = 'Chat API Keyを入力してください / Please enter a Chat API Key';
+      return;
+    }
+    if (!mgGoogleApiKey.trim()) {
+      mgError = 'Google API Keyを入力してください / Please enter a Google API Key';
+      return;
+    }
+
+    mgLoading = true;
+    mgError = '';
+    mgJobId = '';
+    mgJobStatus = null;
+    if (mgPollInterval) clearInterval(mgPollInterval);
+
+    try {
+      const res = await generatePages({
+        manuscript: mgManuscript,
+        system_prompt: mgSystemPrompt,
+        total_pages: mgTotalPages,
+        api_key: chatApiKey,
+        api_base_url: chatApiBaseUrl,
+        model_name: chatModelName,
+        google_api_key: mgGoogleApiKey,
+      });
+      if (res.success && res.job_id) {
+        mgJobId = res.job_id;
+        startPolling(res.job_id);
+      } else {
+        mgError = res.error || 'ジョブ作成に失敗しました / Failed to create job';
+      }
+    } catch (e) {
+      mgError = `通信エラー / Network error: ${e.message}`;
+    } finally {
+      mgLoading = false;
+    }
+  }
+
+  function startPolling(jobId) {
+    if (mgPollInterval) clearInterval(mgPollInterval);
+    mgPollInterval = setInterval(async () => {
+      try {
+        const job = await getJobStatus(jobId);
+        mgJobStatus = job;
+        if (job.status === 'completed' || job.status === 'failed') {
+          clearInterval(mgPollInterval);
+          mgPollInterval = null;
+        }
+      } catch (e) {
+        console.error('Polling error:', e);
+      }
+    }, 2000);
+  }
+
+  function getStatusLabel(status) {
+    const labels = {
+      pending: '待機中 / Pending',
+      generating: '生成中 / Generating',
+      completed: '完了 / Completed',
+      failed: '失敗 / Failed',
+      in_progress: '生成中 / In Progress',
+    };
+    return labels[status] || status;
+  }
+
+  onDestroy(() => {
+    if (mgPollInterval) clearInterval(mgPollInterval);
+  });
 </script>
 
 <main>
@@ -382,9 +467,96 @@
           </button>
         </div>
 
-        {#if ssShowRaw}
-          <pre class="raw-json">{ssRawJson}</pre>
+    {#if ssShowRaw}
+      <pre class="raw-json">{ssRawJson}</pre>
+    {/if}
+      </div>
+    {/if}
+  </section>
+
+  <hr class="divider" />
+
+  <section class="generate-section">
+    <h2>Manga Generator / 漫画生成</h2>
+    <p class="section-desc">原稿から漫画ページを自動生成します / Generate manga pages from manuscript</p>
+
+    <div class="generate-form">
+      <label>
+        <span>Manuscript / 原稿</span>
+        <textarea bind:value={mgManuscript} rows="6" placeholder="漫画の原稿やシナリオを入力..."></textarea>
+      </label>
+      <label>
+        <span>System Prompt / 画風・世界観設定</span>
+        <textarea bind:value={mgSystemPrompt} rows="4" placeholder="画風、キャラクター設定、世界観など..."></textarea>
+      </label>
+      <label>
+        <span>Total Pages / ページ数</span>
+        <input type="number" bind:value={mgTotalPages} min="1" max="20" />
+      </label>
+      <label>
+        <span>Google API Key (画像生成用)</span>
+        <input type="password" bind:value={mgGoogleApiKey} placeholder="Gemini API key" />
+      </label>
+
+      <button on:click={handleGeneratePages} disabled={mgLoading || mgPollInterval}>
+        {#if mgLoading}
+          ジョブ作成中... / Creating job...
+        {:else if mgPollInterval}
+          生成中... / Generating...
+        {:else}
+          漫画を生成 / Generate Manga
         {/if}
+      </button>
+    </div>
+
+    {#if mgError}
+      <div class="error">{mgError}</div>
+    {/if}
+
+    {#if mgJobStatus}
+      <div class="job-status">
+        <h3>Job Status / ジョブ状況</h3>
+        <div class="job-meta">
+          <strong>Job ID:</strong> {mgJobStatus.job_id} |
+          <strong>Status:</strong> <span class="status-badge {mgJobStatus.status}">{getStatusLabel(mgJobStatus.status)}</span> |
+          <strong>Progress:</strong> {mgJobStatus.pages.filter(p => p.status === 'completed').length} / {mgJobStatus.total_pages}
+        </div>
+
+        <div class="pages-grid">
+          {#each mgJobStatus.pages as page}
+            <div class="page-item {page.status}">
+              <div class="page-header">
+                <strong>Page {page.page_number}</strong>
+                <span class="page-status {page.status}">{getStatusLabel(page.status)}</span>
+              </div>
+              {#if page.image_url}
+                <img src={page.image_url} alt="Page {page.page_number}" class="page-image" />
+              {:else}
+                <div class="page-placeholder">
+                  {#if page.status === 'in_progress'}
+                    <div class="spinner"></div>
+                    <span>生成中... / Generating...</span>
+                  {:else if page.status === 'pending'}
+                    <span>待機中... / Waiting...</span>
+                  {:else if page.status === 'failed'}
+                    <span class="fail-text">失敗 / Failed</span>
+                    {#if page.error}
+                      <span class="fail-detail">{page.error}</span>
+                    {/if}
+                  {:else}
+                    <span>-</span>
+                  {/if}
+                </div>
+              {/if}
+              {#if page.prompt}
+                <details class="page-prompt-details">
+                  <summary>Prompt / プロンプト</summary>
+                  <div class="page-prompt-text">{page.prompt}</div>
+                </details>
+              {/if}
+            </div>
+          {/each}
+        </div>
       </div>
     {/if}
   </section>
@@ -869,6 +1041,172 @@
     white-space: pre-wrap;
     word-break: break-word;
     max-height: 400px;
+    overflow-y: auto;
+  }
+
+  /* ── Manga Generator styles ── */
+  .generate-section h2 {
+    margin: 0 0 4px;
+    font-size: 1.3rem;
+    color: #222;
+  }
+
+  .generate-form {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    margin-bottom: 16px;
+  }
+
+  .generate-form input[type="number"] {
+    width: 80px;
+    padding: 8px 10px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    font-size: 1rem;
+  }
+
+  .job-status {
+    margin-top: 16px;
+    padding: 16px;
+    background: #f9f9f9;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+  }
+
+  .job-status h3 {
+    margin: 0 0 12px;
+    font-size: 1.1rem;
+    color: #333;
+  }
+
+  .job-meta {
+    margin-bottom: 16px;
+    padding: 8px 12px;
+    background: #e3f2fd;
+    border-radius: 6px;
+    font-size: 0.9rem;
+    color: #444;
+  }
+
+  .status-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    font-weight: bold;
+  }
+
+  .status-badge.pending { background: #fff9c4; color: #f57f17; }
+  .status-badge.generating { background: #e3f2fd; color: #1976d2; }
+  .status-badge.completed { background: #e8f5e9; color: #388e3c; }
+  .status-badge.failed { background: #ffebee; color: #c62828; }
+
+  .pages-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 16px;
+  }
+
+  .page-item {
+    padding: 12px;
+    background: #fff;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+  }
+
+  .page-item.completed {
+    border-color: #4caf50;
+  }
+
+  .page-item.failed {
+    border-color: #ef5350;
+  }
+
+  .page-item.in_progress {
+    border-color: #2196f3;
+  }
+
+  .page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+
+  .page-status {
+    font-size: 0.8rem;
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+
+  .page-status.pending { background: #fff9c4; color: #f57f17; }
+  .page-status.in_progress { background: #e3f2fd; color: #1976d2; }
+  .page-status.completed { background: #e8f5e9; color: #388e3c; }
+  .page-status.failed { background: #ffebee; color: #c62828; }
+
+  .page-image {
+    width: 100%;
+    border-radius: 6px;
+    border: 1px solid #eee;
+  }
+
+  .page-placeholder {
+    height: 160px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: #fafafa;
+    border-radius: 6px;
+    color: #999;
+    font-size: 0.9rem;
+    gap: 8px;
+  }
+
+  .spinner {
+    width: 32px;
+    height: 32px;
+    border: 3px solid #e0e0e0;
+    border-top-color: #1976d2;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  .fail-text {
+    color: #c62828;
+    font-weight: bold;
+  }
+
+  .fail-detail {
+    font-size: 0.8rem;
+    color: #666;
+  }
+
+  .page-prompt-details {
+    margin-top: 8px;
+  }
+
+  .page-prompt-details summary {
+    font-size: 0.85rem;
+    color: #555;
+    cursor: pointer;
+  }
+
+  .page-prompt-text {
+    margin-top: 4px;
+    padding: 8px;
+    background: #fafafa;
+    border-left: 3px solid #1976d2;
+    font-family: monospace;
+    font-size: 0.8rem;
+    color: #333;
+    line-height: 1.4;
+    max-height: 120px;
     overflow-y: auto;
   }
 </style>

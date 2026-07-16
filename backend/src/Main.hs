@@ -21,14 +21,17 @@ import Data.Text.Encoding (encodeUtf8, decodeUtf8)
 import Data.UUID (toString)
 import Data.UUID.V4 (nextRandom)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
-import System.FilePath (takeExtension, (</>))
+import System.FilePath (takeExtension, takeFileName, (</>))
+import Control.Monad (forM_)
+import Control.Concurrent (forkIO)
 import Network.HTTP.Types.Status (status400, status500)
 import Control.Monad.IO.Class (liftIO)
 import Data.Maybe (fromMaybe, catMaybes, listToMaybe, isNothing, isJust)
 import Control.Exception (try, SomeException, displayException)
 import Network.HTTP.Conduit (HttpException)
-import Database.SQLite.Simple (Connection, open, execute_, execute, query_, query, close)
+import Database.SQLite.Simple (Connection, open, execute_, execute, query_, query, close, ToRow, FromRow, SQLData(..))
 import qualified Database.SQLite.Simple as SQLite
+import Data.Time (getCurrentTime)
 
 -- | Request body for image generation
 data GenerateImageRequest = GenerateImageRequest
@@ -140,6 +143,77 @@ instance ToJSON SplitStoryResponse where
   toJSON (SplitStoryResponse s mData mRaw mErr) = object $
     [ "success" .= s ]
     ++ catMaybes [ ("data" .=) <$> mData, ("raw_json" .=) <$> mRaw, ("error" .=) <$> mErr ]
+
+-- ============================================================
+-- Generate Pages (漫画生成ジョブ) Types
+-- ============================================================
+
+-- | Request body for manga page generation
+data GeneratePagesRequest = GeneratePagesRequest
+  { gpManuscript :: T.Text
+  , gpSystemPrompt :: T.Text
+  , gpTotalPages :: Int
+  , gpApiKey :: T.Text
+  , gpApiBaseUrl :: T.Text
+  , gpModelName :: T.Text
+  , gpGoogleApiKey :: T.Text
+  } deriving (Generic, Show)
+
+instance FromJSON GeneratePagesRequest where
+  parseJSON = withObject "GeneratePagesRequest" $ \v -> GeneratePagesRequest
+    <$> v .: "manuscript"
+    <*> v .: "system_prompt"
+    <*> v .: "total_pages"
+    <*> v .: "api_key"
+    <*> v .: "api_base_url"
+    <*> v .: "model_name"
+    <*> v .: "google_api_key"
+
+-- | Response for job creation
+data GeneratePagesResponse = GeneratePagesResponse
+  { gprSuccess :: Bool
+  , gprJobId :: Maybe T.Text
+  , gprError :: Maybe T.Text
+  } deriving (Generic, Show)
+
+instance ToJSON GeneratePagesResponse where
+  toJSON (GeneratePagesResponse s mJob mErr) = object $
+    [ "success" .= s ]
+    ++ catMaybes [ ("job_id" .=) <$> mJob, ("error" .=) <$> mErr ]
+
+-- | Job status response
+data JobStatusResponse = JobStatusResponse
+  { jsrJobId :: T.Text
+  , jsrStatus :: T.Text
+  , jsrTitle :: Maybe T.Text
+  , jsrTotalPages :: Int
+  , jsrPages :: [PageStatusResponse]
+  } deriving (Generic, Show)
+
+instance ToJSON JobStatusResponse where
+  toJSON (JobStatusResponse jid st title tp ps) = object $
+    [ "job_id" .= jid
+    , "status" .= st
+    , "total_pages" .= tp
+    , "pages" .= ps
+    ]
+    ++ catMaybes [ ("title" .=) <$> title ]
+
+data PageStatusResponse = PageStatusResponse
+  { psrPageNumber :: Int
+  , psrStatus :: T.Text
+  , psrImageUrl :: Maybe T.Text
+  , psrPrompt :: T.Text
+  , psrError :: Maybe T.Text
+  } deriving (Generic, Show)
+
+instance ToJSON PageStatusResponse where
+  toJSON (PageStatusResponse n st mUrl p mErr) = object $
+    [ "page_number" .= n
+    , "status" .= st
+    , "prompt" .= p
+    ]
+    ++ catMaybes [ ("image_url" .=) <$> mUrl, ("error" .=) <$> mErr ]
 
 -- | Split result from LLM (matches JSON schema in DESIGN.md)
 data SplitResult = SplitResult
@@ -278,12 +352,25 @@ instance ToJSON GeminiContent where
   toJSON (GeminiContent Nothing ps)  = object ["parts" .= ps]
 
 data GeminiPart = GeminiPart
-  { text :: Maybe T.Text
+  { geminiText :: Maybe T.Text
+  , geminiInlineData :: Maybe GeminiInlineDataReq
   } deriving (Generic, Show)
 
 instance ToJSON GeminiPart where
-  toJSON (GeminiPart (Just t)) = object ["text" .= t]
-  toJSON (GeminiPart Nothing)  = object []
+  toJSON (GeminiPart (Just t) Nothing) = object ["text" .= t]
+  toJSON (GeminiPart Nothing (Just inline)) = object ["inline_data" .= inline]
+  toJSON _ = object []
+
+data GeminiInlineDataReq = GeminiInlineDataReq
+  { reqMimeType :: T.Text
+  , reqData :: T.Text
+  } deriving (Generic, Show)
+
+instance ToJSON GeminiInlineDataReq where
+  toJSON (GeminiInlineDataReq mt d) = object
+    [ "mime_type" .= mt
+    , "data" .= d
+    ]
 
 data GeminiGenerationConfig = GeminiGenerationConfig
   { responseModalities :: [T.Text]
@@ -405,7 +492,7 @@ extractImageParts resp =
 callGeminiImageAPI :: T.Text -> T.Text -> IO (Either T.Text B.ByteString)
 callGeminiImageAPI apiKey userPrompt = do
   let model = "gemini-3.1-flash-image-preview"
-      contentsList = [ GeminiContent { role = Nothing, parts = [ GeminiPart { text = Just userPrompt } ] } ]
+      contentsList = [ GeminiContent { role = Nothing, parts = [ GeminiPart { geminiText = Just userPrompt, geminiInlineData = Nothing } ] } ]
       genConfig = GeminiGenerationConfig { responseModalities = ["TEXT", "IMAGE"] }
 
   result <- callGeminiAPI apiKey model contentsList genConfig
@@ -436,6 +523,154 @@ callGeminiImageAPI apiKey userPrompt = do
               Right imgBytes -> do
                 putStrLn $ "[INFO] Image decoded: " ++ show (B.length imgBytes) ++ " bytes"
                 return $ Right imgBytes
+
+-- | Call Gemini API to generate an image with previous page reference
+callGeminiImageAPIWithReference :: T.Text -> T.Text -> Maybe FilePath -> IO (Either T.Text B.ByteString)
+callGeminiImageAPIWithReference apiKey userPrompt mRefPath = do
+  refPart <- case mRefPath of
+    Nothing -> return Nothing
+    Just path -> do
+      exists <- doesFileExist path
+      if not exists
+        then do
+          putStrLn $ "[WARN] Reference image not found: " ++ path
+          return Nothing
+        else do
+          bytes <- B.readFile path
+          let base64Data = decodeUtf8 $ Base64.encode bytes
+          putStrLn $ "[INFO] Reference image loaded: " ++ show (B.length bytes) ++ " bytes"
+          return $ Just $ GeminiInlineDataReq "image/png" base64Data
+
+  let model = "gemini-3.1-flash-image-preview"
+      promptWithRef = case mRefPath of
+        Nothing -> userPrompt
+        Just _ -> "Use the previous page image as a style and character reference. Maintain consistency with character designs, art style, and coloring.\n\n" <> userPrompt
+      parts = catMaybes
+        [ Just $ GeminiPart { geminiText = Just promptWithRef, geminiInlineData = Nothing }
+        , (\inline -> GeminiPart { geminiText = Nothing, geminiInlineData = Just inline }) <$> refPart
+        ]
+      contentsList = [ GeminiContent { role = Nothing, parts = parts } ]
+      genConfig = GeminiGenerationConfig { responseModalities = ["TEXT", "IMAGE"] }
+
+  result <- callGeminiAPI apiKey model contentsList genConfig
+  case result of
+    Left err -> return $ Left err
+    Right geminiResp -> do
+      let textParts = extractTextParts geminiResp
+          imageParts = extractImageParts geminiResp
+
+      putStrLn $ "[DEBUG] textParts count: " ++ show (length textParts)
+      putStrLn $ "[DEBUG] imageParts count: " ++ show (length imageParts)
+
+      if isNothing (candidates geminiResp) && null textParts && null imageParts
+        then do
+          putStrLn $ "[ERROR] Gemini returned error JSON (no candidates, text, or image)"
+          return $ Left "Gemini API returned an error. Check logs for details."
+        else case listToMaybe imageParts of
+          Nothing -> do
+            let reason = fromMaybe "No image generated" (listToMaybe textParts)
+            putStrLn $ "[ERROR] No image in Gemini response: " ++ T.unpack reason
+            return $ Left reason
+          Just inline -> do
+            let base64Data = inlineDataData inline
+            case Base64.decode (encodeUtf8 base64Data) of
+              Left err -> do
+                putStrLn $ "[ERROR] Base64 decode failed: " ++ err
+                return $ Left $ T.pack $ "Base64 decode error: " ++ err
+              Right imgBytes -> do
+                putStrLn $ "[INFO] Image decoded: " ++ show (B.length imgBytes) ++ " bytes"
+                return $ Right imgBytes
+
+-- ============================================================
+-- Background Generation Logic
+-- ============================================================
+
+-- | Run page generation in background thread
+runGeneratePages :: Connection -> T.Text -> IO ()
+runGeneratePages conn jobId = do
+  putStrLn $ "[INFO] Starting background generation for job: " ++ T.unpack jobId
+
+  -- Load job info
+  jobRows <- query conn "SELECT manuscript, system_prompt, total_pages, api_key, api_base_url, model_name, google_api_key FROM manga_jobs WHERE id = ?" (SQLite.Only jobId) :: IO [(T.Text, T.Text, Int, T.Text, T.Text, T.Text, T.Text)]
+  case jobRows of
+    [] -> do
+      putStrLn $ "[ERROR] Job not found: " ++ T.unpack jobId
+      execute conn "UPDATE manga_jobs SET status = ?, error_message = ? WHERE id = ?" ("failed" :: T.Text, "Job not found" :: T.Text, jobId)
+    ((manuscript, sysPrompt, totalPages, apiKey, apiBaseUrl, modelName, googleApiKey):_) -> do
+      -- Step 1: Split manuscript
+      putStrLn $ "[INFO] Job " ++ T.unpack jobId ++ ": Splitting manuscript..."
+      splitResult <- callSplitAPI apiKey apiBaseUrl modelName manuscript sysPrompt totalPages
+      case splitResult of
+        Left err -> do
+          putStrLn $ "[ERROR] Job " ++ T.unpack jobId ++ ": Split failed: " ++ T.unpack err
+          execute conn "UPDATE manga_jobs SET status = ?, error_message = ? WHERE id = ?" ("failed" :: T.Text, err, jobId)
+        Right (splitData, _) -> do
+          -- Save characters
+          forM_ (splitCharacters splitData) $ \char -> do
+            execute conn "INSERT INTO manga_characters (job_id, character_id, name, appearance_tags) VALUES (?, ?, ?, ?)"
+              (jobId, charId char, charName char, charAppearance char)
+
+          -- Save pages
+          forM_ (splitPages splitData) $ \page -> do
+            execute conn "INSERT INTO manga_pages (job_id, page_number, status, prompt, scene_time, scene_location, mood, continuity_note, layout_description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              (jobId, pageDefNumber page, "pending" :: T.Text, pageDefFullPrompt page, pageDefSceneTime page, pageDefSceneLocation page, pageDefMood page, pageDefContinuity page, pageDefLayout page)
+
+          -- Update job metadata
+          execute conn "UPDATE manga_jobs SET status = ?, title = ?, art_style = ?, color_scheme = ? WHERE id = ?"
+            ("generating" :: T.Text, metaTitle $ splitMetadata splitData, metaArtStyle $ splitMetadata splitData, fromMaybe "" $ metaColorScheme $ splitMetadata splitData, jobId)
+
+          -- Step 2: Generate images sequentially
+          generatePageImages conn jobId googleApiKey (splitCharacters splitData) (splitPages splitData)
+
+          putStrLn $ "[INFO] Job " ++ T.unpack jobId ++ ": Generation complete"
+
+-- | Generate images for each page sequentially
+generatePageImages :: Connection -> T.Text -> T.Text -> [CharacterDef] -> [PageDef] -> IO ()
+generatePageImages conn jobId googleApiKey chars pages = go Nothing pages
+  where
+    go _ [] = do
+      execute conn "UPDATE manga_jobs SET status = ?, completed_at = datetime('now') WHERE id = ?" ("completed" :: T.Text, jobId)
+      putStrLn $ "[INFO] Job " ++ T.unpack jobId ++ ": All pages completed"
+    go mPrevImagePath (page:rest) = do
+      let pageNum = pageDefNumber page
+      putStrLn $ "[INFO] Job " ++ T.unpack jobId ++ ": Generating page " ++ show pageNum
+      execute conn "UPDATE manga_pages SET status = ? WHERE job_id = ? AND page_number = ?" ("in_progress" :: T.Text, jobId, pageNum)
+
+      let prompt = buildGeminiPagePrompt' (metaArtStyle $ MangaMetadata "" 0 "" Nothing) chars page
+      result <- callGeminiImageAPIWithReference googleApiKey prompt mPrevImagePath
+      case result of
+        Left err -> do
+          putStrLn $ "[ERROR] Job " ++ T.unpack jobId ++ ": Page " ++ show pageNum ++ " failed: " ++ T.unpack err
+          execute conn "UPDATE manga_pages SET status = ?, error_message = ? WHERE job_id = ? AND page_number = ?"
+            ("failed" :: T.Text, err, jobId, pageNum)
+          -- Continue with remaining pages (optional: could stop here)
+          go mPrevImagePath rest
+        Right imgBytes -> do
+          imagePath <- saveGeneratedImage imgBytes
+          let filename = takeFileName imagePath
+          putStrLn $ "[INFO] Job " ++ T.unpack jobId ++ ": Page " ++ show pageNum ++ " saved: " ++ imagePath
+          execute conn "UPDATE manga_pages SET status = ?, image_path = ? WHERE job_id = ? AND page_number = ?"
+            ("completed" :: T.Text, filename, jobId, pageNum)
+          -- Pass this image as reference for next page
+          go (Just $ staticDir </> filename) rest
+
+    buildGeminiPagePrompt' _metadata chars page =
+      T.unlines
+        [ "Manga illustration"
+        , ""
+        , "Characters: " <> T.intercalate "; " (map charAppearance chars)
+        , ""
+        , maybe "" (\t -> "Scene time: " <> t) (pageDefSceneTime page)
+        , maybe "" (\l -> "Location: " <> l) (pageDefSceneLocation page)
+        , maybe "" (\m -> "Mood: " <> m) (pageDefMood page)
+        , maybe "" (\c -> "Continuity: " <> c) (pageDefContinuity page)
+        , maybe "" (\ld -> "Layout: " <> ld) (pageDefLayout page)
+        , ""
+        , pageDefFullPrompt page
+        , ""
+        , "No text, no speech bubbles, no captions, no lettering."
+        , "Clean manga illustration only."
+        ]
 
 -- | Call GPT-compatible API for text chat
 callChatAPI :: T.Text -> T.Text -> T.Text -> T.Text -> Maybe T.Text -> [ChatMessage] -> Maybe Aeson.Value -> IO (Either T.Text T.Text)
@@ -672,6 +907,56 @@ initDB :: IO Connection
 initDB = do
   conn <- open dbPath
   execute_ conn "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+  let createJobsQuery = SQLite.Query $ T.unlines
+        [ "CREATE TABLE IF NOT EXISTS manga_jobs ("
+        , "  id TEXT PRIMARY KEY,"
+        , "  status TEXT NOT NULL,"
+        , "  title TEXT,"
+        , "  total_pages INTEGER NOT NULL,"
+        , "  art_style TEXT,"
+        , "  color_scheme TEXT,"
+        , "  manuscript TEXT,"
+        , "  system_prompt TEXT,"
+        , "  api_key TEXT NOT NULL,"
+        , "  api_base_url TEXT NOT NULL,"
+        , "  model_name TEXT NOT NULL,"
+        , "  google_api_key TEXT NOT NULL,"
+        , "  created_at TEXT NOT NULL,"
+        , "  completed_at TEXT,"
+        , "  error_message TEXT"
+        , ")"
+        ]
+  let createPagesQuery = SQLite.Query $ T.unlines
+        [ "CREATE TABLE IF NOT EXISTS manga_pages ("
+        , "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        , "  job_id TEXT NOT NULL,"
+        , "  page_number INTEGER NOT NULL,"
+        , "  status TEXT NOT NULL,"
+        , "  prompt TEXT NOT NULL,"
+        , "  image_path TEXT,"
+        , "  reference_image_path TEXT,"
+        , "  error_message TEXT,"
+        , "  scene_time TEXT,"
+        , "  scene_location TEXT,"
+        , "  mood TEXT,"
+        , "  continuity_note TEXT,"
+        , "  layout_description TEXT,"
+        , "  FOREIGN KEY (job_id) REFERENCES manga_jobs(id)"
+        , ")"
+        ]
+  let createCharsQuery = SQLite.Query $ T.unlines
+        [ "CREATE TABLE IF NOT EXISTS manga_characters ("
+        , "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        , "  job_id TEXT NOT NULL,"
+        , "  character_id TEXT NOT NULL,"
+        , "  name TEXT NOT NULL,"
+        , "  appearance_tags TEXT NOT NULL,"
+        , "  FOREIGN KEY (job_id) REFERENCES manga_jobs(id)"
+        , ")"
+        ]
+  execute_ conn createJobsQuery
+  execute_ conn createPagesQuery
+  execute_ conn createCharsQuery
   return conn
 
 data SettingsRequest = SettingsRequest
@@ -845,6 +1130,53 @@ main = do
             Right (Right (splitResult, rawJson)) -> do
               liftIO $ putStrLn $ "[INFO] Split story success: " ++ show (length $ splitPages splitResult) ++ " pages"
               json $ SplitStoryResponse True (Just splitResult) (Just rawJson) Nothing
+
+    -- Generate pages endpoint (creates job and starts background generation)
+    post "/api/generate-pages" $ do
+      reqBody <- body
+      case decode reqBody of
+        Nothing -> do
+          liftIO $ putStrLn "[ERROR] Invalid JSON request body for generate-pages"
+          status status400
+          json $ GeneratePagesResponse False Nothing (Just "Invalid JSON request body")
+        Just (GeneratePagesRequest {..}) -> do
+          jobIdStr <- liftIO $ toString <$> nextRandom
+          now <- liftIO $ T.pack . show <$> getCurrentTime
+          let jobId = T.pack jobIdStr
+          liftIO $ execute conn
+            (SQLite.Query "INSERT INTO manga_jobs (id, status, title, total_pages, art_style, color_scheme, manuscript, system_prompt, api_key, api_base_url, model_name, google_api_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            [ SQLText jobId
+            , SQLText "pending"
+            , SQLText ""
+            , SQLInteger (fromIntegral gpTotalPages)
+            , SQLText ""
+            , SQLText ""
+            , SQLText gpManuscript
+            , SQLText gpSystemPrompt
+            , SQLText gpApiKey
+            , SQLText gpApiBaseUrl
+            , SQLText gpModelName
+            , SQLText gpGoogleApiKey
+            , SQLText now
+            ]
+          liftIO $ putStrLn $ "[INFO] Created job " ++ jobIdStr ++ " for " ++ show gpTotalPages ++ " pages"
+          -- Start background generation
+          liftIO $ forkIO $ runGeneratePages conn jobId
+          json $ GeneratePagesResponse True (Just jobId) Nothing
+
+    -- Get job status endpoint
+    get "/api/jobs/:job_id" $ do
+      jobIdStr <- captureParam "job_id"
+      let jobId = T.pack jobIdStr
+      jobRows <- liftIO $ (query conn (SQLite.Query "SELECT status, title, total_pages, error_message FROM manga_jobs WHERE id = ?") (SQLite.Only jobId) :: IO [(T.Text, Maybe T.Text, Int, Maybe T.Text)])
+      case jobRows of
+        [] -> do
+          status status400
+          json $ object ["error" .= ("Job not found" :: String)]
+        ((status_, mTitle, totalPages, mErr):_) -> do
+          pageRows <- liftIO $ (query conn (SQLite.Query "SELECT page_number, status, image_path, prompt, error_message FROM manga_pages WHERE job_id = ? ORDER BY page_number") (SQLite.Only jobId) :: IO [(Int, T.Text, Maybe T.Text, T.Text, Maybe T.Text)])
+          let pages = map (\(n, st, mImg, p, mE) -> PageStatusResponse n st (T.pack . ("/backend/static/images/" ++) . T.unpack <$> mImg) p mE) pageRows
+          json $ JobStatusResponse jobId status_ mTitle totalPages pages
 
     -- Serve generated images
     get "/backend/static/images/:filename" $ do

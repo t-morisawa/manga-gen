@@ -74,3 +74,25 @@ export async function splitStory(request) {
     throw e;
   }
 }
+
+/**
+ * @param {{ manuscript: string, system_prompt: string, total_pages: number, api_key: string, api_base_url: string, model_name: string, google_api_key: string }} request
+ * @returns {Promise<{ success: boolean, job_id?: string, error?: string }>}
+ */
+export async function generatePages(request) {
+  const res = await fetch(`${API_BASE}/api/generate-pages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  });
+  return await res.json();
+}
+
+/**
+ * @param {string} jobId
+ * @returns {Promise<{ job_id: string, status: string, title?: string, total_pages: number, pages: Array<{ page_number: number, status: string, image_url?: string, prompt: string, error?: string }> }>}
+ */
+export async function getJobStatus(jobId) {
+  const res = await fetch(`${API_BASE}/api/jobs/${jobId}`);
+  return await res.json();
+}
