@@ -6,8 +6,16 @@ export default defineConfig({
   plugins: [svelte()],
   server: {
     proxy: {
-      '/api': 'http://localhost:5003',
-      '/backend': 'http://localhost:5003',
+      '/api': {
+        target: 'http://localhost:5003',
+        timeout: 300000,
+        proxyTimeout: 300000,
+      },
+      '/backend': {
+        target: 'http://localhost:5003',
+        timeout: 300000,
+        proxyTimeout: 300000,
+      },
     },
   },
 })

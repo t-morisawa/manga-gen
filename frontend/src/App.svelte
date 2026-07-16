@@ -1,5 +1,5 @@
 <script>
-  import { generateImage, chat, healthCheck, getSettings, saveSettings } from './lib/api.js';
+  import { generateImage, chat, splitStory, healthCheck, getSettings, saveSettings } from './lib/api.js';
 
   let prompt = '';
   let apiKey = '';
@@ -142,6 +142,55 @@
     chatError = '';
     clearChatImage();
   }
+
+  // ── Story Splitter state ──
+  let ssManuscript = '';
+  let ssSystemPrompt = '';
+  let ssTotalPages = 3;
+  let ssLoading = false;
+  let ssError = '';
+  let ssResult = null;
+  let ssRawJson = '';
+  let ssShowRaw = false;
+
+  async function handleSplitStory() {
+    if (!ssManuscript.trim()) {
+      ssError = '原稿を入力してください / Please enter a manuscript';
+      return;
+    }
+    if (!chatApiKey.trim()) {
+      ssError = 'Chat API Keyを入力してください / Please enter a Chat API Key';
+      return;
+    }
+
+    ssLoading = true;
+    ssError = '';
+    ssResult = null;
+    ssRawJson = '';
+
+    try {
+      const res = await splitStory({
+        manuscript: ssManuscript,
+        system_prompt: ssSystemPrompt,
+        total_pages: ssTotalPages,
+        api_key: chatApiKey,
+        api_base_url: chatApiBaseUrl,
+        model_name: chatModelName,
+      });
+      if (res.success && res.data && res.data.metadata) {
+        ssResult = res.data;
+        ssRawJson = res.raw_json || '';
+      } else if (res.success) {
+        ssError = 'レスポンスにデータがありません / Response missing data';
+      } else {
+        ssError = res.error || '原稿分割に失敗しました / Story splitting failed';
+      }
+    } catch (e) {
+      ssError = `通信エラー / Network error: ${e.message}`;
+    } finally {
+      ssLoading = false;
+    }
+  }
 </script>
 
 <main>
@@ -263,6 +312,81 @@
         </button>
       </div>
     </div>
+  </section>
+
+  <hr class="divider" />
+
+  <section class="split-section">
+    <h2>Story Splitter / 原稿分割</h2>
+    <p class="section-desc">原稿をページごとのプロンプトに分割します / Split manuscript into page prompts</p>
+
+    <div class="split-form">
+      <label>
+        <span>Manuscript / 原稿</span>
+        <textarea bind:value={ssManuscript} rows="8" placeholder="漫画の原稿やシナリオを入力..."></textarea>
+      </label>
+      <label>
+        <span>System Prompt / 画風・世界観設定</span>
+        <textarea bind:value={ssSystemPrompt} rows="4" placeholder="画風、キャラクター設定、世界観など..."></textarea>
+      </label>
+      <label>
+        <span>Total Pages / ページ数</span>
+        <input type="number" bind:value={ssTotalPages} min="1" max="20" />
+      </label>
+
+      <button on:click={handleSplitStory} disabled={ssLoading}>
+        {ssLoading ? '分割中... / Splitting...' : '原稿を分割 / Split Story'}
+      </button>
+    </div>
+
+    {#if ssError}
+      <div class="error">{ssError}</div>
+    {/if}
+
+    {#if ssResult && ssResult.metadata}
+      <div class="split-result">
+        <h3>Result / 結果</h3>
+        <div class="result-meta">
+          <strong>Title:</strong> {ssResult.metadata?.title || '(no title)'} |
+          <strong>Pages:</strong> {ssResult.metadata?.total_pages || '-'} |
+          <strong>Style:</strong> {ssResult.metadata?.art_style || '-'}
+        </div>
+
+        <div class="result-pages">
+          {#each ssResult.pages || [] as page}
+            <div class="page-card">
+              <h4>Page {page.page_number}</h4>
+              <div class="page-fields">
+                <div><strong>Reference Mode:</strong> {page.reference_mode}</div>
+                <div><strong>Scene:</strong> {page.scene_time || '-'} @ {page.scene_location || '-'}</div>
+                <div><strong>Mood:</strong> {page.mood || '-'}</div>
+                <div><strong>Continuity:</strong> {page.continuity_note || '-'}</div>
+                <div><strong>Layout:</strong> {page.layout_description || '-'}</div>
+                <div class="page-prompt"><strong>Prompt:</strong> {page.full_page_prompt}</div>
+                {#if page.speech_bubbles && page.speech_bubbles.length > 0}
+                  <div class="page-bubbles">
+                    <strong>Speech Bubbles:</strong>
+                    {#each page.speech_bubbles as bubble}
+                      <span class="bubble">「{bubble.text}」</span>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            </div>
+          {/each}
+        </div>
+
+        <div class="raw-json-toggle">
+          <button class="btn-secondary" on:click={() => ssShowRaw = !ssShowRaw}>
+            {ssShowRaw ? 'Hide Raw JSON / JSONを隠す' : 'Show Raw JSON / JSONを表示'}
+          </button>
+        </div>
+
+        {#if ssShowRaw}
+          <pre class="raw-json">{ssRawJson}</pre>
+        {/if}
+      </div>
+    {/if}
   </section>
 </main>
 
@@ -630,5 +754,121 @@
   .btn-secondary:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+
+  /* ── Story Splitter styles ── */
+  .split-section h2 {
+    margin: 0 0 4px;
+    font-size: 1.3rem;
+    color: #222;
+  }
+
+  .split-form {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    margin-bottom: 16px;
+  }
+
+  .split-form input[type="number"] {
+    width: 80px;
+    padding: 8px 10px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    font-size: 1rem;
+  }
+
+  .split-result {
+    margin-top: 16px;
+    padding: 16px;
+    background: #f9f9f9;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+  }
+
+  .split-result h3 {
+    margin: 0 0 12px;
+    font-size: 1.1rem;
+    color: #333;
+  }
+
+  .result-meta {
+    margin-bottom: 16px;
+    padding: 8px 12px;
+    background: #e3f2fd;
+    border-radius: 6px;
+    font-size: 0.9rem;
+    color: #444;
+  }
+
+  .result-pages {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .page-card {
+    padding: 12px;
+    background: #fff;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+  }
+
+  .page-card h4 {
+    margin: 0 0 8px;
+    font-size: 1rem;
+    color: #1976d2;
+  }
+
+  .page-fields {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 0.9rem;
+    color: #444;
+  }
+
+  .page-prompt {
+    margin-top: 4px;
+    padding: 8px;
+    background: #fafafa;
+    border-left: 3px solid #1976d2;
+    font-family: monospace;
+    font-size: 0.85rem;
+    color: #333;
+    line-height: 1.4;
+  }
+
+  .page-bubbles {
+    margin-top: 4px;
+  }
+
+  .bubble {
+    display: inline-block;
+    margin: 2px 4px;
+    padding: 2px 8px;
+    background: #fff3e0;
+    border-radius: 4px;
+    font-size: 0.85rem;
+  }
+
+  .raw-json-toggle {
+    margin-top: 16px;
+    text-align: center;
+  }
+
+  .raw-json {
+    margin-top: 12px;
+    padding: 12px;
+    background: #263238;
+    color: #aed581;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    line-height: 1.4;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 400px;
+    overflow-y: auto;
   }
 </style>

@@ -8,8 +8,8 @@ module Main where
 import Web.Scotty
 import Network.Wai.Middleware.Cors (simpleCorsResourcePolicy, CorsResourcePolicy(..), cors)
 import Network.Wai.Middleware.RequestLogger (logStdoutDev)
-import Network.HTTP.Conduit (httpLbs, parseRequest, RequestBody(RequestBodyLBS), requestBody, requestHeaders, method, responseBody, newManager, tlsManagerSettings)
-import Data.Aeson (FromJSON, ToJSON, object, (.=), encode, decode, withObject, (.:), (.:?))
+import Network.HTTP.Conduit (httpLbs, parseRequest, RequestBody(RequestBodyLBS), requestBody, requestHeaders, method, responseBody, responseTimeout, responseTimeoutMicro, newManager, tlsManagerSettings)
+import Data.Aeson (FromJSON, ToJSON, object, (.=), encode, decode, decodeStrict, withObject, (.:), (.:?), (.!=))
 import qualified Data.Aeson as Aeson
 import GHC.Generics (Generic)
 import qualified Data.ByteString.Lazy as BL
@@ -104,6 +104,161 @@ instance ToJSON ChatResponse where
   toJSON (ChatResponse s reply err) = object $
     [ "success" .= s ]
     ++ catMaybes [ ("reply" .=) <$> reply, ("error" .=) <$> err ]
+
+-- ============================================================
+-- Split Story (原稿分割) Types
+-- ============================================================
+
+-- | Request body for story splitting
+data SplitStoryRequest = SplitStoryRequest
+  { ssManuscript :: T.Text
+  , ssSystemPrompt :: T.Text
+  , ssTotalPages :: Int
+  , ssApiKey :: T.Text
+  , ssApiBaseUrl :: T.Text
+  , ssModelName :: T.Text
+  } deriving (Generic, Show)
+
+instance FromJSON SplitStoryRequest where
+  parseJSON = withObject "SplitStoryRequest" $ \v -> SplitStoryRequest
+    <$> v .: "manuscript"
+    <*> v .: "system_prompt"
+    <*> v .: "total_pages"
+    <*> v .: "api_key"
+    <*> v .: "api_base_url"
+    <*> v .: "model_name"
+
+-- | Response body for story splitting
+data SplitStoryResponse = SplitStoryResponse
+  { ssrSuccess :: Bool
+  , ssrData :: Maybe SplitResult
+  , ssrRawJson :: Maybe T.Text
+  , ssrError :: Maybe T.Text
+  } deriving (Generic, Show)
+
+instance ToJSON SplitStoryResponse where
+  toJSON (SplitStoryResponse s mData mRaw mErr) = object $
+    [ "success" .= s ]
+    ++ catMaybes [ ("data" .=) <$> mData, ("raw_json" .=) <$> mRaw, ("error" .=) <$> mErr ]
+
+-- | Split result from LLM (matches JSON schema in DESIGN.md)
+data SplitResult = SplitResult
+  { splitMetadata :: MangaMetadata
+  , splitCharacters :: [CharacterDef]
+  , splitPages :: [PageDef]
+  } deriving (Generic, Show)
+
+instance FromJSON SplitResult where
+  parseJSON = withObject "SplitResult" $ \v -> SplitResult
+    <$> v .: "metadata"
+    <*> v .: "characters"
+    <*> v .: "pages"
+
+instance ToJSON SplitResult where
+  toJSON (SplitResult m cs ps) = object
+    [ "metadata" .= m
+    , "characters" .= cs
+    , "pages" .= ps
+    ]
+
+data MangaMetadata = MangaMetadata
+  { metaTitle :: T.Text
+  , metaTotalPages :: Int
+  , metaArtStyle :: T.Text
+  , metaColorScheme :: Maybe T.Text
+  } deriving (Generic, Show)
+
+instance FromJSON MangaMetadata where
+  parseJSON = withObject "MangaMetadata" $ \v -> MangaMetadata
+    <$> v .: "title"
+    <*> v .: "total_pages"
+    <*> v .: "art_style"
+    <*> v .:? "color_scheme"
+
+instance ToJSON MangaMetadata where
+  toJSON (MangaMetadata t tp a c) = object $
+    [ "title" .= t
+    , "total_pages" .= tp
+    , "art_style" .= a
+    ]
+    ++ catMaybes [("color_scheme" .=) <$> c]
+
+data CharacterDef = CharacterDef
+  { charId :: T.Text
+  , charName :: T.Text
+  , charAppearance :: T.Text
+  } deriving (Generic, Show)
+
+instance FromJSON CharacterDef where
+  parseJSON = withObject "CharacterDef" $ \v -> CharacterDef
+    <$> v .: "id"
+    <*> v .: "name"
+    <*> v .: "appearance_tags"
+
+instance ToJSON CharacterDef where
+  toJSON (CharacterDef i n a) = object
+    [ "id" .= i
+    , "name" .= n
+    , "appearance_tags" .= a
+    ]
+
+data PageDef = PageDef
+  { pageDefNumber :: Int
+  , pageDefReferenceMode :: T.Text
+  , pageDefSceneTime :: Maybe T.Text
+  , pageDefSceneLocation :: Maybe T.Text
+  , pageDefMood :: Maybe T.Text
+  , pageDefContinuity :: Maybe T.Text
+  , pageDefLayout :: Maybe T.Text
+  , pageDefFullPrompt :: T.Text
+  , pageDefSpeechBubbles :: [SpeechBubble]
+  } deriving (Generic, Show)
+
+instance FromJSON PageDef where
+  parseJSON = withObject "PageDef" $ \v -> PageDef
+    <$> v .: "page_number"
+    <*> v .: "reference_mode"
+    <*> v .:? "scene_time"
+    <*> v .:? "scene_location"
+    <*> v .:? "mood"
+    <*> v .:? "continuity_note"
+    <*> v .:? "layout_description"
+    <*> v .: "full_page_prompt"
+    <*> v .:? "speech_bubbles" .!= []
+
+instance ToJSON PageDef where
+  toJSON (PageDef n rm st sl m c l fp sb) = object $
+    [ "page_number" .= n
+    , "reference_mode" .= rm
+    , "full_page_prompt" .= fp
+    ]
+    ++ catMaybes
+      [ ("scene_time" .=) <$> st
+      , ("scene_location" .=) <$> sl
+      , ("mood" .=) <$> m
+      , ("continuity_note" .=) <$> c
+      , ("layout_description" .=) <$> l
+      , if null sb then Nothing else Just ("speech_bubbles" .= sb)
+      ]
+
+data SpeechBubble = SpeechBubble
+  { sbText :: T.Text
+  , sbSpeakerId :: Maybe T.Text
+  } deriving (Generic, Show)
+
+instance FromJSON SpeechBubble where
+  parseJSON = withObject "SpeechBubble" $ \v -> SpeechBubble
+    <$> v .: "text"
+    <*> v .:? "speaker_id"
+
+instance ToJSON SpeechBubble where
+  toJSON (SpeechBubble t s) = object $
+    [ "text" .= t ]
+    ++ catMaybes [("speaker_id" .=) <$> s]
+
+-- ============================================================
+-- Gemini API Types
+-- ============================================================
 
 -- | Gemini API request body
 data GeminiRequest = GeminiRequest
@@ -209,6 +364,7 @@ callGeminiAPI apiKey model contentsList genConfig = do
           { method = "POST"
           , requestBody = body
           , requestHeaders = [ ("Content-Type", "application/json") ]
+          , responseTimeout = responseTimeoutMicro (300 * 1000000)
           }
 
     manager <- newManager tlsManagerSettings
@@ -282,8 +438,8 @@ callGeminiImageAPI apiKey userPrompt = do
                 return $ Right imgBytes
 
 -- | Call GPT-compatible API for text chat
-callChatAPI :: T.Text -> T.Text -> T.Text -> T.Text -> Maybe T.Text -> [ChatMessage] -> IO (Either T.Text T.Text)
-callChatAPI apiKey apiBaseUrl modelName userMessage userImage history = do
+callChatAPI :: T.Text -> T.Text -> T.Text -> T.Text -> Maybe T.Text -> [ChatMessage] -> Maybe Aeson.Value -> IO (Either T.Text T.Text)
+callChatAPI apiKey apiBaseUrl modelName userMessage userImage history responseFormat = do
   let url = T.unpack $ apiBaseUrl <> "/chat/completions"
 
   result <- try $ do
@@ -293,6 +449,7 @@ callChatAPI apiKey apiBaseUrl modelName userMessage userImage history = do
         gptReq = GPTChatRequest
           { gptModel = modelName
           , gptMessages = map msgToGPT allMessages
+          , gptResponseFormat = responseFormat
           }
         body = RequestBodyLBS $ encode gptReq
         req' = req
@@ -302,6 +459,7 @@ callChatAPI apiKey apiBaseUrl modelName userMessage userImage history = do
               [ ("Content-Type", "application/json")
               , ("Authorization", "Bearer " <> encodeUtf8 apiKey)
               ]
+          , responseTimeout = responseTimeoutMicro (300 * 1000000)
           }
 
     manager <- newManager tlsManagerSettings
@@ -343,15 +501,98 @@ callChatAPI apiKey apiBaseUrl modelName userMessage userImage history = do
               ]
         in  GPTMessage (chatRole msg) (GPTContentParts parts)
 
--- | GPT-compatible API request types
+-- ============================================================
+-- Split Story Functions
+-- ============================================================
+
+-- | Build the prompt for story splitting LLM call
+buildSplitPrompt :: T.Text -> T.Text -> Int -> T.Text
+buildSplitPrompt manuscript systemPrompt totalPages =
+  T.unlines
+    [ "You are a manga scriptwriter and prompt engineer."
+    , "Analyze the given manuscript and split it into " <> T.pack (show totalPages) <> " manga page generation prompts."
+    , ""
+    , "【Art Style / World Setting】"
+    , systemPrompt
+    , ""
+    , "【Manuscript】"
+    , manuscript
+    , ""
+    , "【Output Rules】"
+    , "Output JSON following this exact schema."
+    , "- `full_page_prompt` must be detailed English prompt directly usable by an image generation AI."
+    , "- `continuity_note` must describe state changes from previous page (clothing, hairstyle, expression, location)."
+    , "- `reference_mode`: first page = \"none\", subsequent pages = \"previous\"."
+    , "- `speech_bubbles` should contain dialog text and speaker_id for each page."
+    , "- Characters defined in `characters` array with `id`, `name`, and `appearance_tags` for consistency."
+    , ""
+    , "【JSON Schema】"
+    , "{"
+    , "  \"metadata\": {"
+    , "    \"title\": \"...\","
+    , "    \"total_pages\": N,"
+    , "    \"art_style\": \"...\","
+    , "    \"color_scheme\": \"...\""
+    , "  },"
+    , "  \"characters\": ["
+    , "    { \"id\": \"...\", \"name\": \"...\", \"appearance_tags\": \"...\" }"
+    , "  ],"
+    , "  \"pages\": ["
+    , "    {"
+    , "      \"page_number\": N,"
+    , "      \"reference_mode\": \"none|previous|first\","
+    , "      \"scene_time\": \"...\","
+    , "      \"scene_location\": \"...\","
+    , "      \"mood\": \"...\","
+    , "      \"continuity_note\": \"...\","
+    , "      \"layout_description\": \"...\","
+    , "      \"full_page_prompt\": \"...\","
+    , "      \"speech_bubbles\": ["
+    , "        { \"text\": \"...\", \"speaker_id\": \"...\" }"
+    , "      ]"
+    , "    }"
+    , "  ]"
+    , "}"
+    , ""
+    , "Output ONLY the JSON. No markdown, no explanation."
+    ]
+
+-- | Call LLM to split manuscript and parse the result
+callSplitAPI :: T.Text -> T.Text -> T.Text -> T.Text -> T.Text -> Int -> IO (Either T.Text (SplitResult, T.Text))
+callSplitAPI apiKey apiBaseUrl modelName manuscript systemPrompt totalPages = do
+  let prompt = buildSplitPrompt manuscript systemPrompt totalPages
+      responseFormat = Just $ Aeson.object
+        [ "type" .= ("json_object" :: T.Text)
+        ]
+
+  -- Call chat API with JSON mode
+  result <- callChatAPI apiKey apiBaseUrl modelName prompt Nothing [] responseFormat
+  case result of
+    Left err -> return $ Left err
+    Right rawJson -> do
+      putStrLn $ "[DEBUG] Raw split response (first 500 chars): " ++ take 500 (T.unpack rawJson)
+      -- Try to parse the JSON
+      case Aeson.decodeStrict (encodeUtf8 rawJson) :: Maybe SplitResult of
+        Nothing -> do
+          putStrLn $ "[ERROR] Failed to parse split result JSON"
+          return $ Left $ "Failed to parse LLM response as JSON. Raw: " <> T.take 200 rawJson
+        Just splitResult -> do
+          putStrLn $ "[INFO] Successfully parsed split result: " ++ show (length $ splitPages splitResult) ++ " pages"
+          return $ Right (splitResult, rawJson)
+
+-- ============================================================
+-- GPT-compatible API Types
 data GPTChatRequest = GPTChatRequest
   { gptModel :: T.Text
   , gptMessages :: [GPTMessage]
+  , gptResponseFormat :: Maybe Aeson.Value
   } deriving (Generic, Show)
 
 instance ToJSON GPTChatRequest where
-  toJSON (GPTChatRequest model msgs) =
-    object ["model" .= model, "messages" .= msgs]
+  toJSON (GPTChatRequest model msgs mFmt) =
+    case mFmt of
+      Nothing -> object ["model" .= model, "messages" .= msgs]
+      Just fmt -> object ["model" .= model, "messages" .= msgs, "response_format" .= fmt]
 
 data GPTMessage = GPTMessage
   { gptRole :: T.Text
@@ -565,7 +806,7 @@ main = do
           json $ ChatResponse False Nothing (Just "Invalid JSON request body")
         Just (ChatRequest {..}) -> do
           liftIO $ putStrLn $ "[INFO] Chat request, message length: " ++ show (T.length reqMessage) ++ ", model: " ++ T.unpack reqModelName ++ ", hasImage: " ++ show (isJust reqImage) ++ ", history: " ++ show (length reqHistory)
-          result <- liftIO $ try $ callChatAPI reqApiKey reqApiBaseUrl reqModelName reqMessage reqImage reqHistory
+          result <- liftIO $ try $ callChatAPI reqApiKey reqApiBaseUrl reqModelName reqMessage reqImage reqHistory Nothing
           case result of
             Left (e :: SomeException) -> do
               let msg = T.pack $ displayException e
@@ -579,6 +820,31 @@ main = do
             Right (Right replyText) -> do
               liftIO $ putStrLn $ "[INFO] Chat reply sent, length: " ++ show (T.length replyText)
               json $ ChatResponse True (Just replyText) Nothing
+
+    -- Split story endpoint
+    post "/api/split-story" $ do
+      reqBody <- body
+      case decode reqBody of
+        Nothing -> do
+          liftIO $ putStrLn "[ERROR] Invalid JSON request body for split-story"
+          status status400
+          json $ SplitStoryResponse False Nothing Nothing (Just "Invalid JSON request body")
+        Just (SplitStoryRequest {..}) -> do
+          liftIO $ putStrLn $ "[INFO] Split story request, manuscript length: " ++ show (T.length ssManuscript) ++ ", pages: " ++ show ssTotalPages ++ ", model: " ++ T.unpack ssModelName
+          result <- liftIO $ try $ callSplitAPI ssApiKey ssApiBaseUrl ssModelName ssManuscript ssSystemPrompt ssTotalPages
+          case result of
+            Left (e :: SomeException) -> do
+              let msg = T.pack $ displayException e
+              liftIO $ putStrLn $ "[ERROR] Unhandled exception in split-story handler: " ++ displayException e
+              status status500
+              json $ SplitStoryResponse False Nothing Nothing (Just msg)
+            Right (Left err) -> do
+              liftIO $ putStrLn $ "[ERROR] Split API returned error: " ++ T.unpack err
+              status status500
+              json $ SplitStoryResponse False Nothing Nothing (Just err)
+            Right (Right (splitResult, rawJson)) -> do
+              liftIO $ putStrLn $ "[INFO] Split story success: " ++ show (length $ splitPages splitResult) ++ " pages"
+              json $ SplitStoryResponse True (Just splitResult) (Just rawJson) Nothing
 
     -- Serve generated images
     get "/backend/static/images/:filename" $ do

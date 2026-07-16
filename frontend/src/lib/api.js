@@ -44,3 +44,33 @@ export async function saveSettings(settings) {
   });
   return await res.json();
 }
+
+/**
+ * @param {{ manuscript: string, system_prompt: string, total_pages: number, api_key: string, api_base_url: string, model_name: string }} request
+ * @returns {Promise<{ success: boolean, data?: object, raw_json?: string, error?: string }>}
+ */
+export async function splitStory(request) {
+  const controller = new AbortController();
+  // Abort after 5 minutes (300s) to prevent indefinite hanging
+  const timeoutId = setTimeout(() => controller.abort(), 300000);
+  try {
+    const res = await fetch(`${API_BASE}/api/split-story`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`HTTP ${res.status}: ${errText}`);
+    }
+    return await res.json();
+  } catch (e) {
+    clearTimeout(timeoutId);
+    if (e.name === 'AbortError') {
+      throw new Error('Request timed out after 5 minutes');
+    }
+    throw e;
+  }
+}
