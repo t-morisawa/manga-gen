@@ -28,6 +28,12 @@ frontend/.vite/
 backend/static/images/*
 !backend/static/images/.gitkeep
 
+# SQLite database files
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
 # Existing external projects (sub-repos)
 ai-comic-factory/
 comic-alpha/
