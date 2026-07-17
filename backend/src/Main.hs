@@ -656,26 +656,15 @@ generatePageImages conn jobId googleApiKey chars pages = go Nothing pages
           putStrLn $ "[INFO] Job " ++ T.unpack jobId ++ ": Page " ++ show pageNum ++ " saved: " ++ imagePath
           execute conn "UPDATE manga_pages SET status = ?, image_path = ? WHERE job_id = ? AND page_number = ?"
             ("completed" :: T.Text, filename, jobId, pageNum)
-          -- Add speech bubbles if any
-          let bubbles = pageDefSpeechBubbles page
-          if null bubbles
-            then return ()
-            else do
-              let bubblesJson = decodeUtf8 $ BL.toStrict $ encode bubbles
-                  scriptPath = "scripts/add_speech_bubbles.py"
-                  fullImagePath = staticDir </> filename
-              putStrLn $ "[INFO] Job " ++ T.unpack jobId ++ ": Adding " ++ show (length bubbles) ++ " speech bubbles to page " ++ show pageNum
-              bubbleResult <- try $ readProcess "python3" [scriptPath, fullImagePath, T.unpack bubblesJson] ""
-              case bubbleResult of
-                Left (e :: SomeException) ->
-                  putStrLn $ "[ERROR] Failed to add speech bubbles for page " ++ show pageNum ++ ": " ++ displayException e
-                Right output ->
-                  putStrLn $ "[INFO] Speech bubbles added for page " ++ show pageNum ++ ": " ++ output
           -- Pass this image as reference for next page
           go (Just $ staticDir </> filename) rest
 
     buildGeminiPagePrompt' _metadata chars page =
-      T.unlines
+      let bubbles = pageDefSpeechBubbles page
+          bubbleInstructions = if null bubbles then ""
+            else "\n【Speech Bubbles to Include】\n" <> T.intercalate "\n" (map formatBubble bubbles) <> "\n"
+          formatBubble b = "- Speaker: " <> fromMaybe "?" (sbSpeakerId b) <> ", Text: " <> sbText b <> ", Position: " <> fromMaybe "near_speaker" (sbPositionHint b)
+      in T.unlines
         [ "Manga illustration"
         , ""
         , "Characters: " <> T.intercalate "; " (map charAppearance chars)
@@ -687,11 +676,9 @@ generatePageImages conn jobId googleApiKey chars pages = go Nothing pages
         , maybe "" (\ld -> "Layout: " <> ld) (pageDefLayout page)
         , ""
         , pageDefFullPrompt page
-        , ""
-        , "No text, no speech bubbles, no captions, no lettering."
-        , "Clean manga illustration only."
-        , "Leave clean empty space near each character's head for Japanese speech bubbles."
-        , "Ensure adequate white/empty margin areas in each panel for dialogue placement."
+        , bubbleInstructions
+        , "Include the above speech bubbles in the image with Japanese text in appropriate manga speech bubble styles (elliptical bubbles with tails pointing to speakers)."
+        , "Draw Japanese text clearly inside the speech bubbles."
         ]
 
 -- | Call GPT-compatible API for text chat
@@ -780,22 +767,8 @@ buildSplitPrompt manuscript systemPrompt totalPages =
     , "- `full_page_prompt` must be detailed English prompt directly usable by an image generation AI."
     , "- `continuity_note` must describe state changes from previous page (clothing, hairstyle, expression, location)."
     , "- `reference_mode`: first page = \"none\", subsequent pages = \"previous\"."
-    , "- `speech_bubbles` should contain dialog text, speaker_id, AND position_hint for each page."
+    , "- `speech_bubbles` should contain dialog text, speaker_id, and position_hint for each page."
     , "- Characters defined in `characters` array with `id`, `name`, and `appearance_tags` for consistency."
-    , ""
-    , "【Speech Bubble Space Reservation】"
-    , "In each `full_page_prompt`, include these instructions to reserve space for speech bubbles:"
-    , "  - 'Leave clean empty space near each character'\"'\"'s head for Japanese speech bubbles.'"
-    , "  - 'Do not draw text, lettering, or captions in the image.'"
-    , "  - 'Ensure adequate white/empty margin areas in each panel for dialogue placement.'"
-    , ""
-    , "【Position Hint for Speech Bubbles】"
-    , "For each speech_bubble, provide a `position_hint` based on expected speaker location:"
-    , "  - `upper_left`: Speaker is in upper-left of panel"
-    , "  - `upper_right`: Speaker is in upper-right of panel (default)"
-    , "  - `lower_left`: Speaker is in lower-left of panel"
-    , "  - `lower_right`: Speaker is in lower-right of panel"
-    , "  - `near_speaker`: Default, place near the speaker'\"'\"'s head"
     , ""
     , "【JSON Schema】"
     , "{"
