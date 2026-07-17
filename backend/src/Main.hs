@@ -977,7 +977,6 @@ initDB = do
         , "  mood TEXT,"
         , "  continuity_note TEXT,"
         , "  layout_description TEXT,"
-        , "  speech_bubbles_json TEXT,"
         , "  FOREIGN KEY (job_id) REFERENCES manga_jobs(id)"
         , ")"
         ]
@@ -994,7 +993,31 @@ initDB = do
   execute_ conn createJobsQuery
   execute_ conn createPagesQuery
   execute_ conn createCharsQuery
+  -- Run migrations to add columns that may be missing in existing DBs
+  runMigration conn
   return conn
+
+-- | Run DB migrations (add columns to existing tables without dropping data)
+runMigration :: Connection -> IO ()
+runMigration conn = do
+  putStrLn "[DB] Running migrations..."
+  -- Add speech_bubbles_json to manga_pages if it doesn't exist
+  addColumn conn "manga_pages" "speech_bubbles_json" "TEXT"
+  putStrLn "[DB] Migrations complete"
+
+-- | Add a column to a table if it doesn't already exist
+addColumn :: Connection -> T.Text -> T.Text -> T.Text -> IO ()
+addColumn conn tableName columnName columnType = do
+  -- Check if column exists using PRAGMA
+  let pragmaQuery = SQLite.Query $ "PRAGMA table_info(" <> tableName <> ")"
+  columns <- query conn pragmaQuery () :: IO [(Int, T.Text, T.Text, Int, Maybe T.Text, Int)]
+  let columnExists = any (\(_, name, _, _, _, _) -> name == columnName) columns
+  if columnExists
+    then putStrLn $ "[DB] Column '" ++ T.unpack columnName ++ "' already exists in '" ++ T.unpack tableName ++ "'"
+    else do
+      putStrLn $ "[DB] Adding column '" ++ T.unpack columnName ++ "' to '" ++ T.unpack tableName ++ "'"
+      let alterQuery = SQLite.Query $ "ALTER TABLE " <> tableName <> " ADD COLUMN " <> columnName <> " " <> columnType
+      execute_ conn alterQuery
 
 data SettingsRequest = SettingsRequest
   { setGoogleApiKey :: Maybe T.Text
