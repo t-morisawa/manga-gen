@@ -1,5 +1,6 @@
 <script>
-  import { generateImage, chat, splitStory, healthCheck, getSettings, saveSettings } from './lib/api.js';
+  import { onDestroy } from 'svelte';
+  import { generateImage, chat, splitStory, generatePages, getJobStatus, healthCheck, getSettings, saveSettings } from './lib/api.js';
 
   let prompt = '';
   let apiKey = '';
@@ -547,6 +548,19 @@
                     <span>-</span>
                   {/if}
                 </div>
+              {/if}
+              {#if page.speech_bubbles_json}
+                <details class="page-bubbles-details">
+                  <summary>Speech Bubbles / セリフ ({JSON.parse(page.speech_bubbles_json).length})</summary>
+                  <div class="page-bubbles-list">
+                    {#each JSON.parse(page.speech_bubbles_json) as bubble}
+                      <div class="bubble-item">
+                        <span class="bubble-speaker">{bubble.speaker_id || '?'}</span>
+                        <span class="bubble-text">「{bubble.text}」</span>
+                      </div>
+                    {/each}
+                  </div>
+                </details>
               {/if}
               {#if page.prompt}
                 <details class="page-prompt-details">
@@ -1208,5 +1222,41 @@
     line-height: 1.4;
     max-height: 120px;
     overflow-y: auto;
+  }
+
+  .page-bubbles-details {
+    margin-top: 8px;
+  }
+
+  .page-bubbles-details summary {
+    font-size: 0.85rem;
+    color: #555;
+    cursor: pointer;
+  }
+
+  .page-bubbles-list {
+    margin-top: 4px;
+    padding: 8px;
+    background: #fff3e0;
+    border-radius: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .bubble-item {
+    display: flex;
+    gap: 6px;
+    font-size: 0.85rem;
+  }
+
+  .bubble-speaker {
+    font-weight: bold;
+    color: #e65100;
+    min-width: 60px;
+  }
+
+  .bubble-text {
+    color: #333;
   }
 </style>

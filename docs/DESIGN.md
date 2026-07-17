@@ -601,6 +601,150 @@ retryWithBackoff maxRetries action = go 0
 6. **Frontend**: 進捗・結果表示UI（**リアルタイム逐次表示対応**）
 7. **統合テスト**
 
+## 11. Phase 2: セリフ・吹き出しの自動合成設計
+
+### 11.1 設計思想
+
+セリフ合成は**画像生成後の自動処理**として実装する。画像生成時に吹き出しを入れない（`No text` 指定）のは変えず、生成後の画像に吹き出しを**後付け合成**する方式。
+
+ただし、**画像生成時に「吹き出しが入るスペースを確保」**という指示をGeminiに出すことで、後付け合成時の被りを防ぐ。
+
+### 11.2 3ステップ自動合成フロー
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│   Step 1     │────▶│   Step 2     │────▶│   Step 3     │
+│  原稿分割    │     │  画像生成    │     │  セリフ合成  │
+│ LLMがJSON    │     │  Gemini      │     │  Python      │
+│ +位置ヒント  │     │ +スペース確保│     │ +固定位置    │
+└──────────────┘     └──────────────┘     └──────────────┘
+```
+
+#### Step 1: 原稿分割（位置ヒント付きJSON生成）
+
+`buildSplitPrompt` に追加指示:
+
+```text
+【吹き出しスペース確保指示】
+`full_page_prompt` に必ず含めること:
+- "Leave clean empty space near each character's head for Japanese speech bubbles"
+- "Do not draw text or lettering in the image"
+- "Ensure adequate white/empty margin areas in each panel for dialogue placement"
+
+【吹き出し位置ヒント】
+各 `speech_bubbles` エントリに `position_hint` を付与:
+- `upper_left`: コマ左上
+- `upper_right`: コマ右上  
+- `lower_left`: コマ左下
+- `lower_right`: コマ右下
+- `near_speaker`: 話者の頭の近く（推奨）
+```
+
+JSONスキーマ拡張:
+```json
+{
+  "speech_bubbles": [
+    {
+      "text": "やばい！遅刻しちゃう！",
+      "speaker_id": "hana",
+      "position_hint": "upper_right"
+    }
+  ]
+}
+```
+
+#### Step 2: 画像生成（スペース確保付き）
+
+Geminiプロンプトに自動付与:
+```text
+Manga illustration, 2020s shoujo manga style...
+
+[自動付与部分]
+Leave clean empty space near each character's head for Japanese speech bubbles.
+Do not draw text or lettering in the image.
+Ensure adequate white/empty margin areas in each panel for dialogue placement.
+```
+
+これにより、Geminiが**被らないように空白スペース**を確保して描画する。
+
+#### Step 3: セリフ合成（Python自動処理）
+
+バックグラウンドで画像生成完了後、自動トリガー:
+
+```python
+# backend/scripts/add_speech_bubbles.py
+# 入力: 生成画像パス + DBからのセリフ情報
+# 出力: 合成済み画像（上書きまたは別ファイル）
+
+処理フロー:
+1. 画像を読み込み（Pillow PIL）
+2. DBから page_number に紐づく speech_bubbles + position_hint を取得
+3. position_hint に基づいて固定位置に吹き出しを配置:
+   - upper_left  → (panel_x + 10%, panel_y + 10%)
+   - upper_right → (panel_x + 70%, panel_y + 10%)
+   - lower_left  → (panel_x + 10%, panel_y + 70%)
+   - lower_right → (panel_x + 70%, panel_y + 70%)
+   - near_speaker → upper_right をデフォルト
+4. 吹き出し形状（楕円）を描画
+5. 日本語フォントでテキスト描画（フォントサイズ自動調整）
+6. 合成済み画像を保存
+```
+
+**配置計算式（パネル内相対位置）:**
+```python
+def calculate_position(hint, panel_rect, bubble_size):
+    x, y, w, h = panel_rect  # パネルの座標・サイズ
+    bx, by = bubble_size     # 吹き出しのサイズ
+    
+    positions = {
+        'upper_left':  (x + w*0.05,  y + h*0.05),
+        'upper_right': (x + w*0.55,  y + h*0.05),
+        'lower_left':  (x + w*0.05,  y + h*0.60),
+        'lower_right': (x + w*0.55,  y + h*0.60),
+        'near_speaker':(x + w*0.55,  y + h*0.10),  # デフォルト
+    }
+    return positions.get(hint, positions['near_speaker'])
+```
+
+### 11.3 DB変更（position_hint対応）
+
+```sql
+-- manga_pages テーブルに追加
+column: speech_bubbles_json TEXT  -- JSON配列 [{text, speaker_id, position_hint}]
+```
+
+### 11.4 フロントエンド表示
+
+進捗画面にセリフ一覧を折りたたみ表示:
+- 各ページカード内に「Speech Bubbles / セリフ (N)」を追加
+- speaker_id + テキストを表示
+- 合成完了後は合成済み画像を表示
+
+### 11.5 代替案（比較）
+
+| 方式 | 精度 | 実装コスト | 備考 |
+|------|------|-----------|------|
+| **本採用: 画像生成時スペース確保 + 固定位置合成** | 中〜高 | 低 | Geminiが空白を作る前提。ヒントに基づき配置 |
+| 案A: VLMに座標推定させる | 高 | 中 | 画像をVLMに見せて座標推定。APIコスト増 |
+| 案B: OpenCVで人物検出 | 最高 | 高 | 自動で空白エリア検出。実装コスト大 |
+| 案C: 手動位置調整UI | 最高 | 中 | ユーザーがドラッグで調整。手間はかかるが確実 |
+
+### 11.6 実装順序
+
+1. `buildSplitPrompt` に「吹き出しスペース確保」+ `position_hint` 指示を追加
+2. `SpeechBubble` 型に `position_hint` フィールド追加
+3. DBに `speech_bubbles_json` カラム追加（JSON配列で保存）
+4. 原稿分割時に `position_hint` を生成・保存
+5. Geminiプロンプトに自動付与部分を追加（`buildGeminiPagePrompt`）
+6. Python合成スクリプト実装（`backend/scripts/add_speech_bubbles.py`）
+7. フロントエンドにセリフ表示UI追加
+
+---
+
+*設計書バージョン: 1.2*
+*更新日: 2026-07-17*
+*変更: Phase 2 セリフ自動合成設計を追加（画像生成時スペース確保 + 固定位置合成方式）*
+
 ---
 
 *設計書バージョン: 1.1*

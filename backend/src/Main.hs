@@ -205,15 +205,16 @@ data PageStatusResponse = PageStatusResponse
   , psrImageUrl :: Maybe T.Text
   , psrPrompt :: T.Text
   , psrError :: Maybe T.Text
+  , psrSpeechBubbles :: Maybe T.Text
   } deriving (Generic, Show)
 
 instance ToJSON PageStatusResponse where
-  toJSON (PageStatusResponse n st mUrl p mErr) = object $
+  toJSON (PageStatusResponse n st mUrl p mErr mBubbles) = object $
     [ "page_number" .= n
     , "status" .= st
     , "prompt" .= p
     ]
-    ++ catMaybes [ ("image_url" .=) <$> mUrl, ("error" .=) <$> mErr ]
+    ++ catMaybes [ ("image_url" .=) <$> mUrl, ("error" .=) <$> mErr, ("speech_bubbles_json" .=) <$> mBubbles ]
 
 -- | Split result from LLM (matches JSON schema in DESIGN.md)
 data SplitResult = SplitResult
@@ -318,17 +319,19 @@ instance ToJSON PageDef where
 data SpeechBubble = SpeechBubble
   { sbText :: T.Text
   , sbSpeakerId :: Maybe T.Text
+  , sbPositionHint :: Maybe T.Text
   } deriving (Generic, Show)
 
 instance FromJSON SpeechBubble where
   parseJSON = withObject "SpeechBubble" $ \v -> SpeechBubble
     <$> v .: "text"
     <*> v .:? "speaker_id"
+    <*> v .:? "position_hint"
 
 instance ToJSON SpeechBubble where
-  toJSON (SpeechBubble t s) = object $
+  toJSON (SpeechBubble t s h) = object $
     [ "text" .= t ]
-    ++ catMaybes [("speaker_id" .=) <$> s]
+    ++ catMaybes [("speaker_id" .=) <$> s, ("position_hint" .=) <$> h]
 
 -- ============================================================
 -- Gemini API Types
@@ -612,8 +615,9 @@ runGeneratePages conn jobId = do
 
           -- Save pages
           forM_ (splitPages splitData) $ \page -> do
-            execute conn "INSERT INTO manga_pages (job_id, page_number, status, prompt, scene_time, scene_location, mood, continuity_note, layout_description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-              (jobId, pageDefNumber page, "pending" :: T.Text, pageDefFullPrompt page, pageDefSceneTime page, pageDefSceneLocation page, pageDefMood page, pageDefContinuity page, pageDefLayout page)
+            let bubblesJson = if null (pageDefSpeechBubbles page) then Nothing else Just $ decodeUtf8 $ BL.toStrict $ encode $ pageDefSpeechBubbles page
+            execute conn "INSERT INTO manga_pages (job_id, page_number, status, prompt, scene_time, scene_location, mood, continuity_note, layout_description, speech_bubbles_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              (jobId, pageDefNumber page, "pending" :: T.Text, pageDefFullPrompt page, pageDefSceneTime page, pageDefSceneLocation page, pageDefMood page, pageDefContinuity page, pageDefLayout page, bubblesJson)
 
           -- Update job metadata
           execute conn "UPDATE manga_jobs SET status = ?, title = ?, art_style = ?, color_scheme = ? WHERE id = ?"
@@ -670,6 +674,8 @@ generatePageImages conn jobId googleApiKey chars pages = go Nothing pages
         , ""
         , "No text, no speech bubbles, no captions, no lettering."
         , "Clean manga illustration only."
+        , "Leave clean empty space near each character's head for Japanese speech bubbles."
+        , "Ensure adequate white/empty margin areas in each panel for dialogue placement."
         ]
 
 -- | Call GPT-compatible API for text chat
@@ -758,8 +764,22 @@ buildSplitPrompt manuscript systemPrompt totalPages =
     , "- `full_page_prompt` must be detailed English prompt directly usable by an image generation AI."
     , "- `continuity_note` must describe state changes from previous page (clothing, hairstyle, expression, location)."
     , "- `reference_mode`: first page = \"none\", subsequent pages = \"previous\"."
-    , "- `speech_bubbles` should contain dialog text and speaker_id for each page."
+    , "- `speech_bubbles` should contain dialog text, speaker_id, AND position_hint for each page."
     , "- Characters defined in `characters` array with `id`, `name`, and `appearance_tags` for consistency."
+    , ""
+    , "【Speech Bubble Space Reservation】"
+    , "In each `full_page_prompt`, include these instructions to reserve space for speech bubbles:"
+    , "  - 'Leave clean empty space near each character'\"'\"'s head for Japanese speech bubbles.'"
+    , "  - 'Do not draw text, lettering, or captions in the image.'"
+    , "  - 'Ensure adequate white/empty margin areas in each panel for dialogue placement.'"
+    , ""
+    , "【Position Hint for Speech Bubbles】"
+    , "For each speech_bubble, provide a `position_hint` based on expected speaker location:"
+    , "  - `upper_left`: Speaker is in upper-left of panel"
+    , "  - `upper_right`: Speaker is in upper-right of panel (default)"
+    , "  - `lower_left`: Speaker is in lower-left of panel"
+    , "  - `lower_right`: Speaker is in lower-right of panel"
+    , "  - `near_speaker`: Default, place near the speaker'\"'\"'s head"
     , ""
     , "【JSON Schema】"
     , "{"
@@ -783,7 +803,7 @@ buildSplitPrompt manuscript systemPrompt totalPages =
     , "      \"layout_description\": \"...\","
     , "      \"full_page_prompt\": \"...\","
     , "      \"speech_bubbles\": ["
-    , "        { \"text\": \"...\", \"speaker_id\": \"...\" }"
+    , "        { \"text\": \"...\", \"speaker_id\": \"...\", \"position_hint\": \"upper_right\" }"
     , "      ]"
     , "    }"
     , "  ]"
@@ -941,6 +961,7 @@ initDB = do
         , "  mood TEXT,"
         , "  continuity_note TEXT,"
         , "  layout_description TEXT,"
+        , "  speech_bubbles_json TEXT,"
         , "  FOREIGN KEY (job_id) REFERENCES manga_jobs(id)"
         , ")"
         ]
@@ -1174,8 +1195,8 @@ main = do
           status status400
           json $ object ["error" .= ("Job not found" :: String)]
         ((status_, mTitle, totalPages, mErr):_) -> do
-          pageRows <- liftIO $ (query conn (SQLite.Query "SELECT page_number, status, image_path, prompt, error_message FROM manga_pages WHERE job_id = ? ORDER BY page_number") (SQLite.Only jobId) :: IO [(Int, T.Text, Maybe T.Text, T.Text, Maybe T.Text)])
-          let pages = map (\(n, st, mImg, p, mE) -> PageStatusResponse n st (T.pack . ("/backend/static/images/" ++) . T.unpack <$> mImg) p mE) pageRows
+          pageRows <- liftIO $ (query conn (SQLite.Query "SELECT page_number, status, image_path, prompt, error_message, speech_bubbles_json FROM manga_pages WHERE job_id = ? ORDER BY page_number") (SQLite.Only jobId) :: IO [(Int, T.Text, Maybe T.Text, T.Text, Maybe T.Text, Maybe T.Text)])
+          let pages = map (\(n, st, mImg, p, mE, mBubbles) -> PageStatusResponse n st (T.pack . ("/backend/static/images/" ++) . T.unpack <$> mImg) p mE mBubbles) pageRows
           json $ JobStatusResponse jobId status_ mTitle totalPages pages
 
     -- Serve generated images
