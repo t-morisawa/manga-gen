@@ -158,6 +158,7 @@ data GeneratePagesRequest = GeneratePagesRequest
   , gpApiBaseUrl :: T.Text
   , gpModelName :: T.Text
   , gpGoogleApiKey :: T.Text
+  , gpStyleImage :: Maybe T.Text
   } deriving (Generic, Show)
 
 instance FromJSON GeneratePagesRequest where
@@ -169,6 +170,7 @@ instance FromJSON GeneratePagesRequest where
     <*> v .: "api_base_url"
     <*> v .: "model_name"
     <*> v .: "google_api_key"
+    <*> v .:? "style_image"
 
 -- | Response for job creation
 data GeneratePagesResponse = GeneratePagesResponse
@@ -528,7 +530,7 @@ callGeminiImageAPI apiKey userPrompt = do
                 putStrLn $ "[INFO] Image decoded: " ++ show (B.length imgBytes) ++ " bytes"
                 return $ Right imgBytes
 
--- | Call Gemini API to generate an image with previous page reference
+-- | Call Gemini API to generate an image with an optional reference image
 callGeminiImageAPIWithReference :: T.Text -> T.Text -> Maybe FilePath -> IO (Either T.Text B.ByteString)
 callGeminiImageAPIWithReference apiKey userPrompt mRefPath = do
   refPart <- case mRefPath of
@@ -546,11 +548,8 @@ callGeminiImageAPIWithReference apiKey userPrompt mRefPath = do
           return $ Just $ GeminiInlineDataReq "image/png" base64Data
 
   let model = "gemini-3.1-flash-image-preview"
-      promptWithRef = case mRefPath of
-        Nothing -> userPrompt
-        Just _ -> "Use the previous page image as a style and character reference. Maintain consistency with character designs, art style, and coloring.\n\n" <> userPrompt
       parts = catMaybes
-        [ Just $ GeminiPart { geminiText = Just promptWithRef, geminiInlineData = Nothing }
+        [ Just $ GeminiPart { geminiText = Just userPrompt, geminiInlineData = Nothing }
         , (\inline -> GeminiPart { geminiText = Nothing, geminiInlineData = Just inline }) <$> refPart
         ]
       contentsList = [ GeminiContent { role = Nothing, parts = parts } ]
@@ -595,12 +594,12 @@ runGeneratePages conn jobId = do
   putStrLn $ "[INFO] Starting background generation for job: " ++ T.unpack jobId
 
   -- Load job info
-  jobRows <- query conn "SELECT manuscript, system_prompt, total_pages, api_key, api_base_url, model_name, google_api_key FROM manga_jobs WHERE id = ?" (SQLite.Only jobId) :: IO [(T.Text, T.Text, Int, T.Text, T.Text, T.Text, T.Text)]
+  jobRows <- query conn "SELECT manuscript, system_prompt, total_pages, api_key, api_base_url, model_name, google_api_key, style_image_path FROM manga_jobs WHERE id = ?" (SQLite.Only jobId) :: IO [(T.Text, T.Text, Int, T.Text, T.Text, T.Text, T.Text, Maybe T.Text)]
   case jobRows of
     [] -> do
       putStrLn $ "[ERROR] Job not found: " ++ T.unpack jobId
       execute conn "UPDATE manga_jobs SET status = ?, error_message = ? WHERE id = ?" ("failed" :: T.Text, "Job not found" :: T.Text, jobId)
-    ((manuscript, sysPrompt, totalPages, apiKey, apiBaseUrl, modelName, googleApiKey):_) -> do
+    ((manuscript, sysPrompt, totalPages, apiKey, apiBaseUrl, modelName, googleApiKey, mStyleImagePath):_) -> do
       -- Step 1: Split manuscript
       putStrLn $ "[INFO] Job " ++ T.unpack jobId ++ ": Splitting manuscript..."
       splitResult <- callSplitAPI apiKey apiBaseUrl modelName manuscript sysPrompt totalPages
@@ -625,13 +624,13 @@ runGeneratePages conn jobId = do
             ("generating" :: T.Text, metaTitle $ splitMetadata splitData, metaArtStyle $ splitMetadata splitData, fromMaybe "" $ metaColorScheme $ splitMetadata splitData, jobId)
 
           -- Step 2: Generate images sequentially
-          generatePageImages conn jobId googleApiKey sysPrompt (splitCharacters splitData) (splitPages splitData)
+          generatePageImages conn jobId googleApiKey sysPrompt (splitCharacters splitData) (splitPages splitData) mStyleImagePath
 
           putStrLn $ "[INFO] Job " ++ T.unpack jobId ++ ": Generation complete"
 
 -- | Generate images for each page sequentially
-generatePageImages :: Connection -> T.Text -> T.Text -> T.Text -> [CharacterDef] -> [PageDef] -> IO ()
-generatePageImages conn jobId googleApiKey sysPrompt chars pages = go Nothing pages
+generatePageImages :: Connection -> T.Text -> T.Text -> T.Text -> [CharacterDef] -> [PageDef] -> Maybe T.Text -> IO ()
+generatePageImages conn jobId googleApiKey sysPrompt chars pages mStyleImagePath = go Nothing pages
   where
     go _ [] = do
       execute conn "UPDATE manga_jobs SET status = ?, completed_at = datetime('now') WHERE id = ?" ("completed" :: T.Text, jobId)
@@ -642,7 +641,20 @@ generatePageImages conn jobId googleApiKey sysPrompt chars pages = go Nothing pa
       execute conn "UPDATE manga_pages SET status = ? WHERE job_id = ? AND page_number = ?" ("in_progress" :: T.Text, jobId, pageNum)
 
       let prompt = buildGeminiPagePrompt sysPrompt chars page
-      result <- callGeminiImageAPIWithReference googleApiKey prompt mPrevImagePath
+          -- For page 1 with a style reference image, attach style instructions
+          -- For subsequent pages, attach previous-page reference instructions
+          (promptWithRef, refImagePath) = case (pageNum == 1, mStyleImagePath) of
+            (True, Just stylePath) ->
+              ( "Use the provided reference image as an art style reference. Match the line art, shading, coloring, and overall aesthetic of this reference image.\n\n" <> prompt
+              , Just $ T.unpack stylePath
+              )
+            (_, _) ->
+              ( case mPrevImagePath of
+                  Nothing -> prompt
+                  Just _ -> "Use the previous page image as a style and character reference. Maintain consistency with character designs, art style, and coloring.\n\n" <> prompt
+              , mPrevImagePath
+              )
+      result <- callGeminiImageAPIWithReference googleApiKey promptWithRef refImagePath
       case result of
         Left err -> do
           putStrLn $ "[ERROR] Job " ++ T.unpack jobId ++ ": Page " ++ show pageNum ++ " failed: " ++ T.unpack err
@@ -991,6 +1003,8 @@ runMigration conn = do
   putStrLn "[DB] Running migrations..."
   -- Add speech_bubbles_json to manga_pages if it doesn't exist
   addColumn conn "manga_pages" "speech_bubbles_json" "TEXT"
+  -- Add style_image_path to manga_jobs if it doesn't exist
+  addColumn conn "manga_jobs" "style_image_path" "TEXT"
   putStrLn "[DB] Migrations complete"
 
 -- | Add a column to a table if it doesn't already exist
@@ -1191,8 +1205,25 @@ main = do
           jobIdStr <- liftIO $ toString <$> nextRandom
           now <- liftIO $ T.pack . show <$> getCurrentTime
           let jobId = T.pack jobIdStr
+
+          -- Save style reference image if provided
+          styleImagePath <- liftIO $ case gpStyleImage of
+            Nothing -> return Nothing
+            Just b64 -> do
+              case Base64.decode (encodeUtf8 b64) of
+                Left err -> do
+                  putStrLn $ "[WARN] Failed to decode style image base64: " ++ err
+                  return Nothing
+                Right imgBytes -> do
+                  ensureStaticDir
+                  styleFilename <- ("style_" ++) . (++ ".png") . toString <$> nextRandom
+                  let stylePath = staticDir </> styleFilename
+                  B.writeFile stylePath imgBytes
+                  putStrLn $ "[INFO] Style image saved: " ++ stylePath
+                  return $ Just $ T.pack stylePath
+
           liftIO $ execute conn
-            (SQLite.Query "INSERT INTO manga_jobs (id, status, title, total_pages, art_style, color_scheme, manuscript, system_prompt, api_key, api_base_url, model_name, google_api_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            (SQLite.Query "INSERT INTO manga_jobs (id, status, title, total_pages, art_style, color_scheme, manuscript, system_prompt, api_key, api_base_url, model_name, google_api_key, style_image_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             [ SQLText jobId
             , SQLText "pending"
             , SQLText ""
@@ -1205,6 +1236,7 @@ main = do
             , SQLText gpApiBaseUrl
             , SQLText gpModelName
             , SQLText gpGoogleApiKey
+            , maybe (SQLText "") SQLText styleImagePath
             , SQLText now
             ]
           liftIO $ putStrLn $ "[INFO] Created job " ++ jobIdStr ++ " for " ++ show gpTotalPages ++ " pages"

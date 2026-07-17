@@ -76,7 +76,7 @@ export async function splitStory(request) {
 }
 
 /**
- * @param {{ manuscript: string, system_prompt: string, total_pages: number, api_key: string, api_base_url: string, model_name: string, google_api_key: string }} request
+ * @param {{ manuscript: string, system_prompt: string, total_pages: number, api_key: string, api_base_url: string, model_name: string, google_api_key: string, style_image?: string | null }} request
  * @returns {Promise<{ success: boolean, job_id?: string, error?: string }>}
  */
 export async function generatePages(request) {

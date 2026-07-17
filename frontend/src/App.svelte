@@ -202,6 +202,30 @@
   let mgJobId = '';
   let mgJobStatus = null;
   let mgPollInterval = null;
+  let mgStyleImageFile = null;
+  let mgStyleImageBase64 = '';
+  let mgStyleImagePreview = '';
+
+  function handleStyleImageSelect(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    mgStyleImageFile = file;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const dataUrl = e.target.result;
+      mgStyleImagePreview = dataUrl;
+      const base64Part = dataUrl.split(',')[1];
+      mgStyleImageBase64 = base64Part;
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function clearStyleImage() {
+    mgStyleImageFile = null;
+    mgStyleImageBase64 = '';
+    mgStyleImagePreview = '';
+  }
 
   async function handleGeneratePages() {
     if (!mgManuscript.trim()) {
@@ -232,6 +256,7 @@
         api_base_url: chatApiBaseUrl,
         model_name: chatModelName,
         google_api_key: apiKey,
+        style_image: mgStyleImageBase64 || null,
       });
       if (res.success && res.job_id) {
         mgJobId = res.job_id;
@@ -493,6 +518,21 @@
         <span>Total Pages / ページ数</span>
         <input type="number" bind:value={mgTotalPages} min="1" max="20" />
       </label>
+      <div class="form-row">
+        <span>Style Reference Image / 画風参照画像 (1P目に使用)</span>
+        <div class="style-image-row">
+          {#if mgStyleImagePreview}
+            <div class="style-image-preview">
+              <img src={mgStyleImagePreview} alt="Style preview" />
+              <button class="btn-remove-image" on:click={clearStyleImage}>×</button>
+            </div>
+          {/if}
+          <label class="btn-upload">
+            <input type="file" accept="image/*" on:change={handleStyleImageSelect} disabled={mgLoading || mgPollInterval} />
+            画風画像を選択 / Select Style Image
+          </label>
+        </div>
+      </div>
       <div class="api-key-note">
         {#if apiKey}
           Google API Key: 保存済み / Saved ✓
@@ -685,7 +725,7 @@
     gap: 14px;
   }
 
-  label {
+  label, .form-row {
     display: flex;
     flex-direction: column;
     gap: 6px;
@@ -1273,5 +1313,24 @@
   .api-key-note .warning {
     color: #e65100;
     font-weight: bold;
+  }
+
+  .style-image-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 6px;
+  }
+
+  .style-image-preview {
+    position: relative;
+    display: inline-block;
+  }
+
+  .style-image-preview img {
+    max-width: 120px;
+    max-height: 120px;
+    border-radius: 6px;
+    border: 1px solid #ccc;
   }
 </style>
