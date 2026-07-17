@@ -197,7 +197,6 @@
   let mgManuscript = '';
   let mgSystemPrompt = '';
   let mgTotalPages = 3;
-  let mgGoogleApiKey = '';
   let mgLoading = false;
   let mgError = '';
   let mgJobId = '';
@@ -213,8 +212,8 @@
       mgError = 'Chat API Keyを入力してください / Please enter a Chat API Key';
       return;
     }
-    if (!mgGoogleApiKey.trim()) {
-      mgError = 'Google API Keyを入力してください / Please enter a Google API Key';
+    if (!apiKey.trim()) {
+      mgError = 'Google API Keyを設定してください / Please set a Google API Key in Settings';
       return;
     }
 
@@ -232,7 +231,7 @@
         api_key: chatApiKey,
         api_base_url: chatApiBaseUrl,
         model_name: chatModelName,
-        google_api_key: mgGoogleApiKey,
+        google_api_key: apiKey,
       });
       if (res.success && res.job_id) {
         mgJobId = res.job_id;
@@ -494,10 +493,13 @@
         <span>Total Pages / ページ数</span>
         <input type="number" bind:value={mgTotalPages} min="1" max="20" />
       </label>
-      <label>
-        <span>Google API Key (画像生成用)</span>
-        <input type="password" bind:value={mgGoogleApiKey} placeholder="Gemini API key" />
-      </label>
+      <div class="api-key-note">
+        {#if apiKey}
+          Google API Key: 保存済み / Saved ✓
+        {:else}
+          Google API Key: <span class="warning">未設定 / Not set</span> → API Settingsで入力
+        {/if}
+      </div>
 
       <button on:click={handleGeneratePages} disabled={mgLoading || mgPollInterval}>
         {#if mgLoading}
@@ -1258,5 +1260,18 @@
 
   .bubble-text {
     color: #333;
+  }
+
+  .api-key-note {
+    padding: 10px 12px;
+    background: #e8f5e9;
+    border-radius: 6px;
+    font-size: 0.9rem;
+    color: #2e7d32;
+  }
+
+  .api-key-note .warning {
+    color: #e65100;
+    font-weight: bold;
   }
 </style>
