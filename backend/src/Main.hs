@@ -24,6 +24,7 @@ import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath (takeExtension, takeFileName, (</>))
 import Control.Monad (forM_)
 import Control.Concurrent (forkIO)
+import System.Process (readProcess)
 import Network.HTTP.Types.Status (status400, status500)
 import Control.Monad.IO.Class (liftIO)
 import Data.Maybe (fromMaybe, catMaybes, listToMaybe, isNothing, isJust)
@@ -655,6 +656,21 @@ generatePageImages conn jobId googleApiKey chars pages = go Nothing pages
           putStrLn $ "[INFO] Job " ++ T.unpack jobId ++ ": Page " ++ show pageNum ++ " saved: " ++ imagePath
           execute conn "UPDATE manga_pages SET status = ?, image_path = ? WHERE job_id = ? AND page_number = ?"
             ("completed" :: T.Text, filename, jobId, pageNum)
+          -- Add speech bubbles if any
+          let bubbles = pageDefSpeechBubbles page
+          if null bubbles
+            then return ()
+            else do
+              let bubblesJson = decodeUtf8 $ BL.toStrict $ encode bubbles
+                  scriptPath = "scripts/add_speech_bubbles.py"
+                  fullImagePath = staticDir </> filename
+              putStrLn $ "[INFO] Job " ++ T.unpack jobId ++ ": Adding " ++ show (length bubbles) ++ " speech bubbles to page " ++ show pageNum
+              bubbleResult <- try $ readProcess "python3" [scriptPath, fullImagePath, T.unpack bubblesJson] ""
+              case bubbleResult of
+                Left (e :: SomeException) ->
+                  putStrLn $ "[ERROR] Failed to add speech bubbles for page " ++ show pageNum ++ ": " ++ displayException e
+                Right output ->
+                  putStrLn $ "[INFO] Speech bubbles added for page " ++ show pageNum ++ ": " ++ output
           -- Pass this image as reference for next page
           go (Just $ staticDir </> filename) rest
 
