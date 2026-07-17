@@ -625,13 +625,13 @@ runGeneratePages conn jobId = do
             ("generating" :: T.Text, metaTitle $ splitMetadata splitData, metaArtStyle $ splitMetadata splitData, fromMaybe "" $ metaColorScheme $ splitMetadata splitData, jobId)
 
           -- Step 2: Generate images sequentially
-          generatePageImages conn jobId googleApiKey (splitCharacters splitData) (splitPages splitData)
+          generatePageImages conn jobId googleApiKey sysPrompt (splitCharacters splitData) (splitPages splitData)
 
           putStrLn $ "[INFO] Job " ++ T.unpack jobId ++ ": Generation complete"
 
 -- | Generate images for each page sequentially
-generatePageImages :: Connection -> T.Text -> T.Text -> [CharacterDef] -> [PageDef] -> IO ()
-generatePageImages conn jobId googleApiKey chars pages = go Nothing pages
+generatePageImages :: Connection -> T.Text -> T.Text -> T.Text -> [CharacterDef] -> [PageDef] -> IO ()
+generatePageImages conn jobId googleApiKey sysPrompt chars pages = go Nothing pages
   where
     go _ [] = do
       execute conn "UPDATE manga_jobs SET status = ?, completed_at = datetime('now') WHERE id = ?" ("completed" :: T.Text, jobId)
@@ -641,7 +641,7 @@ generatePageImages conn jobId googleApiKey chars pages = go Nothing pages
       putStrLn $ "[INFO] Job " ++ T.unpack jobId ++ ": Generating page " ++ show pageNum
       execute conn "UPDATE manga_pages SET status = ? WHERE job_id = ? AND page_number = ?" ("in_progress" :: T.Text, jobId, pageNum)
 
-      let prompt = buildGeminiPagePrompt' (metaArtStyle $ MangaMetadata "" 0 "" Nothing) chars page
+      let prompt = buildGeminiPagePrompt sysPrompt chars page
       result <- callGeminiImageAPIWithReference googleApiKey prompt mPrevImagePath
       case result of
         Left err -> do
@@ -659,26 +659,41 @@ generatePageImages conn jobId googleApiKey chars pages = go Nothing pages
           -- Pass this image as reference for next page
           go (Just $ staticDir </> filename) rest
 
-    buildGeminiPagePrompt' _metadata chars page =
+    -- | Build Gemini prompt with system prompt, characters, page details, and speech bubbles
+    buildGeminiPagePrompt :: T.Text -> [CharacterDef] -> PageDef -> T.Text
+    buildGeminiPagePrompt systemPrompt chars page =
       let bubbles = pageDefSpeechBubbles page
           bubbleInstructions = if null bubbles then ""
             else "\n【Speech Bubbles to Include】\n" <> T.intercalate "\n" (map formatBubble bubbles) <> "\n"
           formatBubble b = "- Speaker: " <> fromMaybe "?" (sbSpeakerId b) <> ", Text: " <> sbText b <> ", Position: " <> fromMaybe "near_speaker" (sbPositionHint b)
+          layoutHint = maybe "" id (pageDefLayout page)
       in T.unlines
-        [ "Manga illustration"
+        [ "【Art Style / World Setting】"
+        , systemPrompt
         , ""
-        , "Characters: " <> T.intercalate "; " (map charAppearance chars)
+        , "【Page Requirements】"
+        , "This is a MANGA COMIC PAGE with multiple panels (not a single illustration)."
+        , "Draw multiple manga panels with white gutters between them."
+        , "Each panel should show a different scene or angle."
+        , "Maintain Japanese manga reading order (right-to-left, top-to-bottom)."
+        , if T.null layoutHint then "" else "Layout: " <> layoutHint
+        , ""
+        , "【Characters】"
+        , T.intercalate "\n" (map (\c -> "- " <> charName c <> ": " <> charAppearance c) chars)
         , ""
         , maybe "" (\t -> "Scene time: " <> t) (pageDefSceneTime page)
         , maybe "" (\l -> "Location: " <> l) (pageDefSceneLocation page)
         , maybe "" (\m -> "Mood: " <> m) (pageDefMood page)
-        , maybe "" (\c -> "Continuity: " <> c) (pageDefContinuity page)
-        , maybe "" (\ld -> "Layout: " <> ld) (pageDefLayout page)
+        , maybe "" (\c -> "Continuity from previous page: " <> c) (pageDefContinuity page)
         , ""
+        , "【Scene Description】"
         , pageDefFullPrompt page
         , bubbleInstructions
         , "Include the above speech bubbles in the image with Japanese text in appropriate manga speech bubble styles (elliptical bubbles with tails pointing to speakers)."
         , "Draw Japanese text clearly inside the speech bubbles."
+        , ""
+        , "【Output Format】"
+        , "Output a full manga comic page (not a single illustration). Multiple panels with speech bubbles."
         ]
 
 -- | Call GPT-compatible API for text chat
