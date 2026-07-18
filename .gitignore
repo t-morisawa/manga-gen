@@ -38,3 +38,11 @@ backend/static/images/*
 ai-comic-factory/
 comic-alpha/
 comics_generator/
+
+# Editor / IDE settings
+.vscode/
+
+# HLS / editor environment config
+hie.yaml
+backend/hie.yaml
+backend/cabal.project
